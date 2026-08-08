@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interactive Code Runner</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+  <style>
+    :root {
+      --bg: #09090b;
+      --surface: rgba(255, 255, 255, 0.03);
+      --surface-hover: rgba(255, 255, 255, 0.08);
+      --border: rgba(255, 255, 255, 0.1);
+      --border-glow: rgba(99, 102, 241, 0.5);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #6366f1;
+      --primary-hover: #818cf8;
+      --danger: #ef4444;
+      --success: #10b981;
+      --font-ui: 'Outfit', sans-serif;
+      --font-code: 'Fira Code', monospace;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: var(--font-ui);
+      background-color: var(--bg);
+      color: var(--text-main);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background-image: radial-gradient(circle at 15% 50%, rgba(99, 102, 241, 0.08), transparent 25%),
+                        radial-gradient(circle at 85% 30%, rgba(139, 92, 246, 0.08), transparent 25%);
+    }
+    
+    header {
+      padding: 1.5rem 2rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(9, 9, 11, 0.8);
+      backdrop-filter: blur(12px);
+      z-index: 10;
+    }
+    .logo-container {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, var(--primary), #8b5cf6);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 15px rgba(99, 102, 241, 0.4);
+    }
+    .logo-icon svg {
+      stroke: white;
+      width: 20px;
+      height: 20px;
+    }
+    h1 {
+      font-weight: 600;
+      font-size: 1.25rem;
+      letter-spacing: 0.5px;
+      background: linear-gradient(to right, #fff, #a5b4fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    
+    .main-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      flex: 1;
+      height: calc(100vh - 73px);
+    }
+    
+    /* Code Editor Side */
+    .editor-section {
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+    .panel-header {
+      padding: 1rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .panel-title {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+    .btn-run {
+      background: linear-gradient(135deg, var(--primary), #8b5cf6);
+      color: white;
+      border: none;
+      padding: 0.5rem 1.25rem;
+      border-radius: 6px;
+      font-family: var(--font-ui);
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+    }
+    .btn-run:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.4);
+    }
+    .btn-run:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    
+    .code-container {
+      flex: 1;
+      position: relative;
+      background: #1e1e2e;
+    }
+    .editor-textarea, .editor-display {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      width: 100%; height: 100%;
+      padding: 1.5rem;
+      font-family: var(--font-code);
+      font-size: 14px;
+      line-height: 1.6;
+      border: none;
+      background: transparent;
+      margin: 0;
+    }
+    .editor-textarea {
+      color: transparent;
+      caret-color: #fff;
+      resize: none;
+      outline: none;
+      z-index: 2;
+    }
+    .editor-display {
+      z-index: 1;
+      pointer-events: none;
+      overflow-y: auto;
+    }
+    .editor-textarea::selection {
+      background: rgba(99, 102, 241, 0.3);
+      color: transparent;
+    }
+
+    /* Terminal Side */
+    .terminal-section {
+      display: flex;
+      flex-direction: column;
+      background: #0f111a;
+    }
+    .terminal-header {
+      padding: 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .terminal-status {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--text-muted);
+      transition: background 0.3s ease;
+    }
+    .status-dot.active {
+      background: var(--success);
+      box-shadow: 0 0 8px var(--success);
+    }
+    .btn-kill {
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      padding: 0.35rem 0.75rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      cursor: pointer;
+      display: none;
+      transition: all 0.2s;
+    }
+    .btn-kill:hover {
+      background: rgba(239, 68, 68, 0.1);
+      border-color: var(--danger);
+    }
+    
+    .terminal-output {
+      flex: 1;
+      padding: 1.5rem;
+      overflow-y: auto;
+      font-family: var(--font-code);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .log-line { color: #e2e8f0; word-break: break-all; white-space: pre-wrap; }
+    .log-sys { color: #64748b; font-style: italic; }
+    .log-in { color: #a5b4fc; }
+    .log-err { color: #ef4444; }
+    
+    .terminal-input-bar {
+      padding: 1rem 1.5rem;
+      border-top: 1px solid var(--border);
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+      background: rgba(0,0,0,0.2);
+    }
+    .prompt-symbol {
+      color: var(--success);
+      font-weight: bold;
+      font-family: var(--font-code);
+    }
+    .terminal-input-bar input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: white;
+      font-family: var(--font-code);
+      font-size: 14px;
+      outline: none;
+    }
+    .terminal-input-bar input:disabled {
+      opacity: 0.5;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo-container">
+      <div class="logo-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="16 18 22 12 16 6"></polyline>
+          <polyline points="8 6 2 12 8 18"></polyline>
+        </svg>
+      </div>
+      <h1>Interactive Code Runner</h1>
+    </div>
+  </header>
+
+  <div class="main-grid">
+    <!-- Editor Side -->
+    <div class="editor-section">
+      <div class="panel-header">
+        <span class="panel-title">Python Editor</span>
+        <button class="btn-run" id="btn-run" onclick="runCode()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+          Run Code
+        </button>
+      </div>
+      <div class="code-container">
+        <!-- Display syntax highlighted code -->
+        <pre class="editor-display"><code class="language-python" id="code-display"></code></pre>
+        <!-- Actual editable textarea -->
+        <textarea class="editor-textarea" id="code-editor" spellcheck="false" oninput="syncEditor()" onscroll="syncScroll()"># Write your interactive Python code here!
+name = input("What is your name? ")
+print(f"Hello, {name}! Welcome to the interactive environment.")
+</textarea>
+      </div>
+    </div>
+
+    <!-- Terminal Side -->
+    <div class="terminal-section">
+      <div class="terminal-header">
+        <div class="terminal-status">
+          <div class="status-dot" id="status-dot"></div>
+          <span id="status-text">Ready</span>
+        </div>
+        <button class="btn-kill" id="btn-kill" onclick="killProcess()">Kill Process</button>
+      </div>
+      <div class="terminal-output" id="terminal-output">
+        <div class="log-line log-sys">System initialized. Awaiting code execution.</div>
+      </div>
+      <div class="terminal-input-bar">
+        <span class="prompt-symbol">❯</span>
+        <input type="text" id="term-input" placeholder="Program input..." disabled autocomplete="off">
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Editor Sync & Highlight
+    const editor = document.getElementById('code-editor');
+    const display = document.getElementById('code-display');
+    const termOut = document.getElementById('terminal-output');
+    const termInput = document.getElementById('term-input');
+    const btnRun = document.getElementById('btn-run');
+    const btnKill = document.getElementById('btn-kill');
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+
+    let currentProcessId = null;
+    let ws = null;
+
+    function syncEditor() {
+      let code = editor.value;
+      // Handle trailing newline for proper scroll alignment
+      if (code[code.length-1] === '\n') {
+        code += ' ';
+      }
+      display.textContent = code;
+      delete display.dataset.highlighted;
+      hljs.highlightElement(display);
+    }
+    
+    function syncScroll() {
+      display.parentElement.scrollTop = editor.scrollTop;
+      display.parentElement.scrollLeft = editor.scrollLeft;
+    }
+
+    // Initialize Editor
+    syncEditor();
+    
+    // Tab support
+    editor.addEventListener('keydown', function(e) {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const start = this.selectionStart;
+        const end = this.selectionEnd;
+        this.value = this.value.substring(0, start) + "    " + this.value.substring(end);
+        this.selectionStart = this.selectionEnd = start + 4;
+        syncEditor();
+      }
+    });
+
+    // Terminal Logging
+    function logTerm(msg, type = "log-line") {
+      const div = document.createElement('div');
+      div.className = type;
+      div.innerText = msg;
+      termOut.appendChild(div);
+      termOut.scrollTop = termOut.scrollHeight;
+    }
+
+    // Connect WebSocket
+    function connectWS() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${window.location.host}/ws/swarm`);
+      
+      ws.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (data.type === "INTERACTIVE_OUTPUT" && data.process_id === currentProcessId) {
+          logTerm(data.text, "log-line");
+        } else if (data.type === "PROCESS_DONE" && data.process_id === currentProcessId) {
+          processEnded(data.exit_code);
+        }
+      };
+      
+      ws.onclose = () => {
+        setTimeout(connectWS, 2000);
+      };
+    }
+    connectWS();
+
+    function setRunningState(isRunning) {
+      if (isRunning) {
+        statusDot.classList.add('active');
+        statusText.innerText = "Process Running";
+        btnRun.disabled = true;
+        btnRun.innerHTML = `Running...`;
+        btnKill.style.display = "block";
+        termInput.disabled = false;
+        termInput.focus();
+      } else {
+        statusDot.classList.remove('active');
+        statusText.innerText = "Ready";
+        btnRun.disabled = false;
+        btnRun.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg> Run Code`;
+        btnKill.style.display = "none";
+        termInput.disabled = true;
+      }
+    }
+
+    async function runCode() {
+      const code = editor.value.trim();
+      if (!code) return;
+      
+      termOut.innerHTML = '';
+      logTerm("Starting execution...", "log-sys");
+      currentProcessId = "cr_" + Date.now();
+      
+      setRunningState(true);
+
+      try {
+        const res = await fetch("/api/run/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code: code,
+            process_id: currentProcessId,
+            user_id: "coderunner_user",
+            session_id: "coderunner_session"
+          })
+        });
+        if (!res.ok) throw new Error("Failed to start process");
+      } catch (err) {
+        logTerm(`Error: ${err.message}`, "log-err");
+        setRunningState(false);
+      }
+    }
+
+    async function killProcess() {
+      if (!currentProcessId) return;
+      try {
+        await fetch("/api/run/kill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ process_id: currentProcessId, text: "" })
+        });
+        logTerm("[Killed by User]", "log-err");
+      } catch (err) {}
+      processEnded(-1);
+    }
+
+    function processEnded(code) {
+      currentProcessId = null;
+      setRunningState(false);
+      if (code === 0) {
+        logTerm(`\n[Process completed successfully]`, "log-sys");
+      } else if (code !== -1) {
+        logTerm(`\n[Process exited with code ${code}]`, "log-err");
+      }
+    }
+
+    termInput.addEventListener('keydown', async (e) => {
+      if (e.key === 'Enter' && currentProcessId) {
+        const text = termInput.value;
+        termInput.value = '';
+        logTerm(`> ${text}`, "log-in");
+        
+        try {
+          await fetch("/api/run/input", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ process_id: currentProcessId, text: text })
+          });
+        } catch (err) {
+          console.error("Input send failed", err);
+        }
+      }
+    });
+  </script>
+</body>
+</html>

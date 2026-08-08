@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DevSecOps AI Swarm Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- VS Code Dark Theme Highlight.js -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/vs2015.min.css">
+  <link rel="stylesheet" href="/static/styles.css?v=2">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+</head>
+<body>
+  <!-- Ambient Light Background Glows -->
+  <div class="ambient-glow glow-1"></div>
+  <div class="ambient-glow glow-2"></div>
+
+  <!-- Auth Modal Overlay -->
+  <div class="auth-modal-overlay" id="auth-modal">
+    <div class="auth-card card-3d glassmorphic">
+      <div class="auth-header">
+        <div class="auth-brand animated-glow">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <span>DevSecOps Enterprise</span>
+        </div>
+        <h1 id="auth-title">Sign In to Your Workspace</h1>
+        <p id="auth-subtitle">Access your isolated multi-tenant application security environment</p>
+      </div>
+
+      <div class="alert-box alert-error" id="auth-error" style="display: none;">
+        <span id="auth-error-text">Authentication error</span>
+      </div>
+
+      <form id="auth-form" onsubmit="handleAuthSubmit(event)">
+        <div class="form-group" id="group-fullname" style="display: none;">
+          <label for="auth-fullname">Full Name</label>
+          <input type="text" id="auth-fullname" placeholder="Jane Doe">
+        </div>
+
+        <div class="form-group">
+          <label for="auth-email">Email Address</label>
+          <input type="email" id="auth-email" placeholder="name@company.com" required>
+        </div>
+
+        <div class="form-group">
+          <label for="auth-password">Password</label>
+          <input type="password" id="auth-password" placeholder="••••••••••••" required minlength="6">
+        </div>
+
+        <button type="submit" class="btn-auth-submit btn-3d glow-button" id="auth-submit-btn">
+          <span>Sign In to Workspace</span>
+        </button>
+      </form>
+
+      <div class="auth-toggle">
+        <span id="auth-toggle-text">Don't have a workspace account?</span>
+        <button type="button" class="btn-toggle" onclick="toggleAuthMode()">Sign Up</button>
+      </div>
+
+      <div style="margin-top: 12px; text-align: center;">
+        <button type="button" onclick="continueAsGuest()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: rgba(255,255,255,0.5); padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: var(--font-main);">Continue as Guest (No Login)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Main Multi-Session Shell Layout -->
+  <div class="sidebar-layout-container" id="app-content">
+    
+    <!-- SIDEBAR BACKDROP OVERLAY -->
+    <div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeSidebar()"></div>
+
+    <!-- FLOATING OVERLAY DRAWER SIDEBAR -->
+    <aside class="sidebar glassmorphic" id="sidebar">
+      <div class="sidebar-top">
+        <div class="sidebar-header-row">
+          <button class="btn-new-chat btn-3d glow-button" onclick="createNewChatSession()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>New Chat</span>
+          </button>
+          <button class="btn-close-sidebar" onclick="closeSidebar()" title="Close Sidebar">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="sidebar-section-title">
+        <span>PROJECT WORKSPACES</span>
+      </div>
+
+      <div class="chat-history-list" id="chat-history-list">
+        <div class="empty-history-text">Loading chat sessions...</div>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="btn-collapse-sidebar" onclick="toggleSidebar()" id="collapse-btn" title="Toggle Sidebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+          <span class="collapse-label">Collapse Sidebar</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- MAIN DASHBOARD CONTAINER -->
+    <div class="main-content-wrapper">
+      
+      <!-- Top Navigation Header -->
+      <header class="navbar card-static-pop glassmorphic">
+        <div class="logo">
+          <button class="sidebar-trigger-btn" onclick="toggleSidebar()" title="Toggle Project Workspaces">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+          </button>
+
+          <div class="logo-icon-svg">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <div>
+            <h1 class="gradient-text">DevSecOps Swarm Engine</h1>
+            <p class="subtitle">Autonomous Code Generation, Pytest QA, Red-Team Audit & AppSec Remediation</p>
+          </div>
+        </div>
+
+        <div class="header-controls">
+          <div id="user-badge-container" style="display: none;">
+            <div class="user-badge glassmorphic">
+              <div class="user-avatar" id="user-avatar-initial">A</div>
+              <span class="user-email-text" id="user-email-display">user@devsecops.io</span>
+            </div>
+          </div>
+          <button class="export-pdf-btn btn-3d glow-button" onclick="downloadPdfReport()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            <span>Compliance PDF</span>
+          </button>
+          <button class="export-btn btn-3d glow-button" onclick="downloadSecurePackage()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            <span>Export Package</span>
+          </button>
+          <button class="logout-btn btn-3d" id="signout-btn" onclick="signOutUser()" style="display: none;">Sign Out</button>
+        </div>
+      </header>
+
+      <main class="dashboard-grid">
+        
+        <!-- Prompt Execution & Config Panel -->
+        <section class="card card-static-pop glassmorphic">
+          <div class="card-header">
+            <h2 class="gradient-text">Prompt Execution Engine</h2>
+            <span class="badge badge-cherry">Autonomous Pipeline</span>
+          </div>
+          <p class="card-description">Specify target software requirements and configuration parameters below:</p>
+          
+          <div class="prompt-engine-box">
+            <div class="input-row-main">
+              <input type="text" id="prompt-input" placeholder="e.g. Build me a banking wallet REST API in Python with JWT authorization..." value="Build me a to-do list in Python">
+              <button class="glow-button btn-3d" id="run-btn" onclick="executeSwarmLoop()">Execute Swarm Loop</button>
+            </div>
+
+            <div class="input-row-controls">
+              <div class="control-field">
+                <label for="model-select">Target AI Model</label>
+                <select id="model-select">
+                  <option value="gemini" selected>Gemini Cloud API (Key Enabled)</option>
+                  <option value="auto">Auto-Detect / Dynamic Synthesizer</option>
+                  <option value="qwen2.5-coder:1.5b">Qwen 2.5 Coder 1.5B (Local Ollama)</option>
+                  <option value="llama3.2:latest">Llama 3.2 (Local Ollama)</option>
+                </select>
+              </div>
+
+              <div class="control-field">
+                <label for="max-loops-select">Iteration Limit</label>
+                <select id="max-loops-select">
+                  <option value="3" selected>3 Loops</option>
+                  <option value="5">5 Loops</option>
+                  <option value="10">10 Loops</option>
+                  <option value="20">20 Loops</option>
+                </select>
+              </div>
+
+              <div class="sample-prompts-inline">
+                <button class="prompt-tag btn-3d" onclick="setPrompt('Build me a to-do list in Python')">To-Do List App</button>
+                <button class="prompt-tag btn-3d" onclick="setPrompt('Build a secure banking wallet API in Python')">Banking Wallet API</button>
+                <button class="prompt-tag btn-3d" onclick="setPrompt('Build a calculator app with math expression evaluator')">Calculator App</button>
+                <button class="prompt-tag btn-3d" onclick="setPrompt('Build a user auth API with SQLite')">User Auth API</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Real-Time Metrics & Security Posture -->
+        <section class="metrics-grid">
+          <div class="metric-card card-static-pop glassmorphic">
+            <div class="metric-icon-svg">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            </div>
+            <div>
+              <div class="metric-value" id="metric-qa">100%</div>
+              <div class="metric-label">Pytest QA Pass Rate</div>
+            </div>
+          </div>
+
+          <div class="metric-card card-static-pop glassmorphic">
+            <div class="metric-icon-svg">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            </div>
+            <div>
+              <div class="metric-value" id="metric-security">GRADE A+</div>
+              <div class="metric-label">Bandit SAST Rating</div>
+            </div>
+          </div>
+
+          <div class="metric-card card-static-pop glassmorphic">
+            <div class="metric-icon-svg">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+            </div>
+            <div>
+              <div class="metric-value" id="metric-time">4.5 Dev Hrs</div>
+              <div class="metric-label">Saved Security Engineering Time</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Swarm Topology Visualizer -->
+        <section class="card topology-card card-static-pop glassmorphic">
+          <div class="card-header">
+            <h2 class="gradient-text">Swarm Agent Pipeline</h2>
+            <div class="loop-controls">
+              <span class="loop-indicator">Iteration: <span id="loop-counter">0</span> / <span id="max-loop-display">10</span></span>
+              <button class="extend-btn btn-3d" id="extend-btn" onclick="extendIterations()">Extend +5 Loops</button>
+            </div>
+          </div>
+
+          <div class="agents-pipeline">
+            <!-- Agent 1 -->
+            <div class="agent-node card-static-pop" id="agent-coder">
+              <div class="agent-role-tag">AGENT 01</div>
+              <div class="agent-info">
+                <h3>Coder Agent</h3>
+                <p>Code Synthesizer</p>
+              </div>
+              <div class="agent-status" id="status-coder"><span class="status-dot dot-idle"></span> IDLE</div>
+            </div>
+
+            <div class="pipeline-connector animated-bounce">➔</div>
+
+            <!-- Agent 2 -->
+            <div class="agent-node card-static-pop" id="agent-tester">
+              <div class="agent-role-tag">AGENT 02</div>
+              <div class="agent-info">
+                <h3>Tester Agent</h3>
+                <p>QA & Pytest Execution</p>
+              </div>
+              <div class="agent-status" id="status-tester"><span class="status-dot dot-idle"></span> IDLE</div>
+            </div>
+
+            <div class="pipeline-connector animated-bounce">➔</div>
+
+            <!-- Agent 3 -->
+            <div class="agent-node card-static-pop" id="agent-hacker">
+              <div class="agent-role-tag">AGENT 03</div>
+              <div class="agent-info">
+                <h3>Hacker Agent</h3>
+                <p>Red Team / Bandit SAST</p>
+              </div>
+              <div class="agent-status" id="status-hacker"><span class="status-dot dot-idle"></span> IDLE</div>
+            </div>
+
+            <div class="pipeline-connector animated-bounce">➔</div>
+
+            <!-- Agent 4 -->
+            <div class="agent-node card-static-pop" id="agent-patcher">
+              <div class="agent-role-tag">AGENT 04</div>
+              <div class="agent-info">
+                <h3>Patcher Agent</h3>
+                <p>AppSec Remediation</p>
+              </div>
+              <div class="agent-status" id="status-patcher"><span class="status-dot dot-idle"></span> IDLE</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Workspace Inspector Block -->
+        <section class="card workspace-card card-static-pop glassmorphic" style="display: flex; padding: 0;">
+          
+          <!-- File Explorer Sidebar -->
+          <div id="file-explorer" class="file-explorer" style="width: 250px; border-right: 1px solid var(--card-border); display: flex; flex-direction: column;">
+            <div class="explorer-header" style="padding: 12px; font-weight: bold; border-bottom: 1px solid var(--card-border);">
+              &#128193; Project Files
+            </div>
+            <div id="file-tree" class="file-tree" style="flex: 1; overflow-y: auto; padding: 8px;">
+              <!-- File nodes go here -->
+            </div>
+          </div>
+
+          <!-- Main Editor Area -->
+          <div style="flex: 1; display: flex; flex-direction: column; min-width: 0; padding: 24px;">
+            <div class="workspace-tabs" style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <button class="btn-3d" id="sidebar-toggle-btn" onclick="toggleFileExplorer()" style="padding: 6px 10px; margin-right: 8px;">&#9776;</button>
+              <button class="tab-btn active" id="tab-btn-code" onclick="switchTab('code')">app.py (Code Editor)</button>
+              <button class="tab-btn" onclick="switchTab('test')">test_app.py</button>
+              <button class="tab-btn" onclick="switchTab('audit')">Security Report</button>
+              <button class="tab-btn" onclick="switchTab('diff')">Patch Diff</button>
+              <button class="tab-btn highlight-tab" onclick="switchTab('exploit')">Red-Team Live Exploit Sandbox</button>
+              <button class="tab-btn" onclick="switchTab('terminal')">Live Console Logs</button>
+              <button class="tab-btn highlight-tab" onclick="switchTab('run')">&#9654; Interactive Run</button>
+            </div>
+
+          <!-- Interactive Code Editor Tab with VS Code Syntax Highlighting -->
+          <div class="tab-content active" id="tab-code">
+            <div class="editor-header">
+              <span>Source Code Workspace: Edit app.py directly to test security posture</span>
+              <div class="editor-actions">
+                <button class="copy-code-btn btn-3d" id="copy-code-btn" onclick="copyActiveCode()">&#128203; Copy Code</button>
+                <button class="edit-toggle-btn btn-3d" id="edit-toggle-btn" onclick="toggleEditMode()">&#9999;&#65039; Edit Custom Code</button>
+                <button class="edit-toggle-btn btn-3d" id="save-code-btn" onclick="saveCodeLocally()" style="display:none; color: var(--accent-green);">&#128190; Save File</button>
+                <button class="run-code-btn btn-3d glow-button" id="run-code-btn" onclick="runInteractive()">&#9654; Run Interactive</button>
+                <button class="audit-custom-btn btn-3d glow-button" onclick="auditCustomCode()">Audit Code Changes</button>
+              </div>
+            </div>
+            
+            <div class="code-container vscode-theme-box">
+              <pre class="vscode-code-pre"><code class="language-python" id="code-display"># Code output will render here with VS Code syntax highlighting...</code></pre>
+              <textarea id="code-editor" spellcheck="false" placeholder="# Source code workspace..." style="display: none;"></textarea>
+            </div>
+          </div>
+
+          <div class="tab-content" id="tab-test">
+            <div class="code-container vscode-theme-box">
+              <pre class="vscode-code-pre"><code class="language-python" id="test-display"># Generated Pytest suite...</code></pre>
+            </div>
+          </div>
+
+          <div class="tab-content" id="tab-audit">
+            <div class="audit-header" style="display: flex; justify-content: flex-end; padding: 8px 16px;">
+              <button class="edit-toggle-btn btn-3d" onclick="downloadAuditReport()" style="display: flex; align-items: center; gap: 6px;">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Download Report
+              </button>
+            </div>
+            <div class="audit-container" id="audit-display">
+              <div class="audit-placeholder">
+                <p class="empty-state">No security vulnerability report generated yet. Run the swarm to analyze app.py with Bandit.</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-content" id="tab-diff">
+            <div class="diff-view-container">
+              <div class="diff-box vscode-theme-box">
+                <h4>Vulnerable Version (Pre-Patch)</h4>
+                <pre class="vscode-code-pre"><code class="language-python" id="diff-before">// Initial code before patch</code></pre>
+              </div>
+              <div class="diff-box vscode-theme-box">
+                <h4>Remediated Version (Post-Patch)</h4>
+                <pre class="vscode-code-pre"><code class="language-python" id="diff-after">// Securitized code after patch</code></pre>
+              </div>
+            </div>
+          </div>
+
+          <!-- LIVE EXPLOIT SIMULATION SANDBOX -->
+          <div class="tab-content" id="tab-exploit">
+            <div class="exploit-sandbox-container">
+              <div class="exploit-header">
+                <div>
+                  <h3 class="gradient-text">Interactive Live OWASP Exploit Payload Tester</h3>
+                  <p>Simulate dynamic cyber attack payloads directly against the current workspace code to verify Pre-Patch vs. Post-Patch behavior</p>
+                </div>
+              </div>
+
+              <div class="exploit-payload-grid">
+                <div class="payload-card card-3d" onclick="selectPayload('eval')">
+                  <span class="payload-type">CWE-95 / RCE</span>
+                  <h4>Remote Code Execution (eval)</h4>
+                  <code>__import__('os').system('whoami')</code>
+                </div>
+
+                <div class="payload-card card-3d" onclick="selectPayload('sqli')">
+                  <span class="payload-type">CWE-89 / SQLi</span>
+                  <h4>SQL Injection Bypass</h4>
+                  <code>' OR '1'='1' --</code>
+                </div>
+
+                <div class="payload-card card-3d" onclick="selectPayload('traversal')">
+                  <span class="payload-type">CWE-22 / Path Traversal</span>
+                  <h4>Arbitrary File Read</h4>
+                  <code>../../../../etc/passwd</code>
+                </div>
+              </div>
+
+              <div class="exploit-runner-box">
+                <div class="form-group">
+                  <label for="exploit-input">Target Exploit Payload</label>
+                  <input type="text" id="exploit-input" value="__import__('os').system('whoami')">
+                </div>
+                <button class="btn-exploit btn-3d glow-button" id="btn-run-exploit" onclick="runExploitSimulation()">Launch Live Exploit Simulation</button>
+              </div>
+
+              <div class="exploit-result-box" id="exploit-result" style="display: none;">
+                <div class="result-column pre-patch card-3d">
+                  <div class="result-title">Vulnerable Pre-Patch Code State</div>
+                  <div class="result-status status-danger pulse-danger">Exploit Execution Successful (SYSTEM COMPROMISED)</div>
+                  <div class="terminal-box">
+                    <pre><code id="exploit-out-pre">Arbitrary payload executed in process memory.</code></pre>
+                  </div>
+                </div>
+
+                <div class="result-column post-patch card-3d">
+                  <div class="result-title">Securitized Post-Patch Code State</div>
+                  <div class="result-status status-safe pulse-success">Exploit Safely Blocked (AST Evaluator Guardrail)</div>
+                  <div class="terminal-box">
+                    <pre><code id="exploit-out-post">ValueError: Unsupported operation syntax blocked cleanly.</code></pre>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="tab-content" id="tab-terminal">
+            <div class="terminal-view" id="terminal-output">
+              <div class="terminal-line system">[System initialized. Ready to execute prompt...]</div>
+            </div>
+          </div>
+
+          <!-- Interactive Run Terminal Tab -->
+          <div class="tab-content" id="tab-run">
+            <div class="run-terminal-wrapper">
+              <div class="run-terminal-header">
+                <span id="run-status-label" class="run-status-idle">● No process running</span>
+                <button class="btn-3d run-kill-btn" id="run-kill-btn" onclick="killRunProcess()" style="display:none;">■ Kill Process</button>
+              </div>
+              <div class="run-output terminal-view" id="run-output">
+                <div class="terminal-line system">[Interactive Run terminal ready. Click "▶ Run Interactive" in the code editor to execute your code here.]</div>
+              </div>
+              <div class="run-input-bar" id="run-input-bar">
+                <span class="run-prompt-symbol">❯</span>
+                <input type="text" id="run-input-field" placeholder="Type input and press Enter to send to running program..." disabled autocomplete="off" spellcheck="false" />
+                <button class="btn-3d run-send-btn" id="run-send-btn" onclick="sendRunInput()" disabled>Send ↵</button>
+              </div>
+            </div>
+          </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- AJENSIKS Chat Widget -->
+  <div id="ajensiks-widget" class="ajensiks-widget">
+    <div id="ajensiks-header" class="ajensiks-header" onclick="toggleAjensiks()">
+      <div class="ajensiks-title">
+        <span class="status-dot dot-passed"></span>
+        AJENSIKS AI Guide
+      </div>
+      <button class="ajensiks-toggle-btn" id="ajensiks-toggle-icon">&#128172;</button>
+    </div>
+    <div id="ajensiks-body" class="ajensiks-body" style="display: none;">
+      <div id="ajensiks-messages" class="ajensiks-messages">
+        <div class="chat-msg ai-msg">
+          Hello! I am AJENSIKS, your DevSecOps AI guide. I'm tracking your workspace. How can I help?
+        </div>
+      </div>
+      <div class="ajensiks-input-area">
+        <input type="text" id="ajensiks-input" placeholder="Ask about code, UI, or anything..." autocomplete="off">
+        <button id="ajensiks-send" onclick="sendAjensiksMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

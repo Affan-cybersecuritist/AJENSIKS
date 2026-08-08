@@ -1,0 +1,42 @@
+# Dependencies & Package Managers
+node_modules/
+.pnp
+.pnp.js
+
+# Build Outputs & Framework Caches
+.next/
+out/
+build/
+dist/
+
+# Python Cache & Virtual Environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+env/
+venv/
+ENV/
+
+# Environment Variables & Keys (Security)
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# User Session Workspaces & Temporary Files
+user_workspaces/
+security_report.json
+vulnerability_report.md
+*.log
+
+# IDE & OS System Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
