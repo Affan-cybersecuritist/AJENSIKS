@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "backend": "npx kill-port 8000 && python -m uvicorn server:app --host 127.0.0.1 --port 8000",
+    "dev:all": "concurrently -n BACKEND,FRONTEND -c blue,green \"npm:backend\" \"npm:dev\""
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
@@ -18,6 +20,8 @@
     "@types/node": "^20.14.10",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
+    "concurrently": "^10.0.5",
+    "kill-port": "^2.0.1",
     "typescript": "^5.5.3"
   }
 }

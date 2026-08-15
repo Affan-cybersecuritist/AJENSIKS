@@ -1,20 +1,22 @@
 'use client';
 
 import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { supabase } from '../lib/supabaseClient';
 
 export default function HomePage() {
+  const router = useRouter();
   useEffect(() => {
     const redirectUser = async () => {
       const { data: { session } } = await supabase.auth.getSession();
       if (session) {
-        window.location.href = '/dashboard';
+        router.push('/dashboard');
       } else {
-        window.location.href = '/login';
+        router.push('/login');
       }
     };
     redirectUser();
-  }, []);
+  }, [router]);
 
   return (
     <div style={{

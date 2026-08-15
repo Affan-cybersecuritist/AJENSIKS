@@ -13,6 +13,8 @@
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
 </head>
 <body>
   <!-- Ambient Light Background Glows -->
@@ -169,12 +171,11 @@
               </div>
 
               <div class="control-field">
-                <label for="max-loops-select">Iteration Limit</label>
-                <select id="max-loops-select">
-                  <option value="3" selected>3 Loops</option>
-                  <option value="5">5 Loops</option>
-                  <option value="10">10 Loops</option>
-                  <option value="20">20 Loops</option>
+                <label for="language-select">Target Language</label>
+                <select id="language-select">
+                  <option value="python" selected>Python</option>
+                  <option value="cpp">C++</option>
+                  <option value="java">Java</option>
                 </select>
               </div>
 
@@ -315,6 +316,7 @@
                 <button class="edit-toggle-btn btn-3d" id="edit-toggle-btn" onclick="toggleEditMode()">&#9999;&#65039; Edit Custom Code</button>
                 <button class="edit-toggle-btn btn-3d" id="save-code-btn" onclick="saveCodeLocally()" style="display:none; color: var(--accent-green);">&#128190; Save File</button>
                 <button class="run-code-btn btn-3d glow-button" id="run-code-btn" onclick="runInteractive()">&#9654; Run Interactive</button>
+                <button class="run-code-btn btn-3d glow-button" id="recheck-btn" onclick="runActiveCode()" title="Run the code and, if it errors, automatically ask the AI to fix it and retry">&#128260; Recheck with AI</button>
                 <button class="audit-custom-btn btn-3d glow-button" onclick="auditCustomCode()">Audit Code Changes</button>
               </div>
             </div>
@@ -445,28 +447,6 @@
     </div>
   </div>
 
-  <!-- AJENSIKS Chat Widget -->
-  <div id="ajensiks-widget" class="ajensiks-widget">
-    <div id="ajensiks-header" class="ajensiks-header" onclick="toggleAjensiks()">
-      <div class="ajensiks-title">
-        <span class="status-dot dot-passed"></span>
-        AJENSIKS AI Guide
-      </div>
-      <button class="ajensiks-toggle-btn" id="ajensiks-toggle-icon">&#128172;</button>
-    </div>
-    <div id="ajensiks-body" class="ajensiks-body" style="display: none;">
-      <div id="ajensiks-messages" class="ajensiks-messages">
-        <div class="chat-msg ai-msg">
-          Hello! I am AJENSIKS, your DevSecOps AI guide. I'm tracking your workspace. How can I help?
-        </div>
-      </div>
-      <div class="ajensiks-input-area">
-        <input type="text" id="ajensiks-input" placeholder="Ask about code, UI, or anything..." autocomplete="off">
-        <button id="ajensiks-send" onclick="sendAjensiksMessage()">➤</button>
-      </div>
-    </div>
-  </div>
-
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

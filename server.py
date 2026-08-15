@@ -8,7 +8,8 @@ import io
 import zipfile
 import time
 import shutil
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import uuid
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -27,22 +28,39 @@ os.makedirs(workspaces_dir, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+@app.middleware("http")
+async def no_cache_static_assets(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/static/") or request.url.path == "/":
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 active_websockets = []
 active_processes = {}   # process_id -> asyncio.subprocess.Process
-active_workflow_state = {
-    "max_loops": 10,
-    "current_loop": 0,
-    "is_running": False,
-    "selected_model": None
-}
+workflow_states = {}    # (user_id, session_id) -> {"max_loops", "current_loop", "is_running", "selected_model"}
+                         # Per-run state — NOT global — so concurrent runs (different tabs/users,
+                         # or a test run happening alongside a real one) never corrupt each other's
+                         # loop counters or running flags.
+
+def get_workflow_state(user_id: str, session_id) -> dict:
+    key = (user_id, session_id)
+    if key not in workflow_states:
+        workflow_states[key] = {"max_loops": 10, "current_loop": 0, "is_running": False, "selected_model": None}
+    return workflow_states[key]
 
 API_KEY_MODEL = "Gemini Cloud API (Key Enabled)"
+CLAUDE_API_KEY_MODEL = "Claude API (Key Enabled)"
+OPENROUTER_API_KEY_MODEL = "OpenRouter API (Key Enabled)"
 PROVIDED_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+PROVIDED_ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+PROVIDED_OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 def is_api_key_model(model_name: str) -> bool:
     if not model_name: return False
     m = model_name.lower()
-    return "gemini" in m or "openrouter" in m or "deepseek" in m or "qwen" in m or m == API_KEY_MODEL.lower()
+    return m == API_KEY_MODEL.lower() or m == CLAUDE_API_KEY_MODEL.lower() or m == OPENROUTER_API_KEY_MODEL.lower()
 
 async def broadcast(data: dict):
     for ws in list(active_websockets):
@@ -62,6 +80,7 @@ class PromptRequest(BaseModel):
     user_id: str = "default_user"
     session_id: Optional[str] = None
     api_key: Optional[str] = None
+    language: str = "python"
 
 class CustomCodeRequest(BaseModel):
     code: str
@@ -69,25 +88,20 @@ class CustomCodeRequest(BaseModel):
     session_id: Optional[str] = None
     filename: str = "generated_app.py"
 
-class ChatRequest(BaseModel):
-    message: str
-    user_id: str = "default_user"
-    session_id: Optional[str] = None
-    context_code: str = ""
-    selected_model: Optional[str] = None
-
 class RunCodeRequest(BaseModel):
     code: str
     user_id: str = "default_user"
     session_id: Optional[str] = None
     selected_model: Optional[str] = None
-    max_attempts: int = 3
+    max_attempts: int = 2
+    language: str = "python"
 
 class RunInteractiveRequest(BaseModel):
     code: str
     process_id: str
     user_id: str = "default_user"
     session_id: Optional[str] = None
+    language: str = "python"
 
 class SendInputRequest(BaseModel):
     process_id: str
@@ -104,9 +118,21 @@ class RenameSessionRequest(BaseModel):
     session_id: str
     new_title: str
 
+class ExtendRequest(BaseModel):
+    user_id: str = "default_user"
+    session_id: Optional[str] = None
+
+NO_CACHE_HEADERS = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+
+def secure_join(base: str, *paths: str) -> str:
+    final_path = os.path.abspath(os.path.join(base, *(str(p) for p in paths if p)))
+    if not final_path.startswith(os.path.abspath(base)):
+        raise ValueError("Path traversal detected")
+    return final_path
+
 @app.get("/")
 async def get_index():
-    return FileResponse(os.path.join(static_dir, "index.html"))
+    return FileResponse(os.path.join(static_dir, "index.html"), headers=NO_CACHE_HEADERS)
 
 @app.get("/coderunner")
 async def get_code_runner():
@@ -117,6 +143,10 @@ async def list_models():
     models = [
         API_KEY_MODEL
     ]
+    if PROVIDED_ANTHROPIC_API_KEY:
+        models.append(CLAUDE_API_KEY_MODEL)
+    if PROVIDED_OPENROUTER_API_KEY:
+        models.append(OPENROUTER_API_KEY_MODEL)
     try:
         r = requests.get("http://localhost:11434/api/tags", timeout=3)
         if r.status_code == 200:
@@ -133,7 +163,7 @@ async def list_models():
 
 @app.get("/api/sessions/{user_id}")
 async def list_user_sessions(user_id: str):
-    user_sessions_dir = os.path.join(workspaces_dir, user_id, "sessions")
+    user_sessions_dir = secure_join(workspaces_dir, user_id, "sessions")
     os.makedirs(user_sessions_dir, exist_ok=True)
     index_file = os.path.join(user_sessions_dir, "sessions_index.json")
     if os.path.exists(index_file):
@@ -146,7 +176,7 @@ async def list_user_sessions(user_id: str):
 
 @app.post("/api/sessions/create")
 async def create_user_session(req: CreateSessionRequest):
-    user_sessions_dir = os.path.join(workspaces_dir, req.user_id, "sessions")
+    user_sessions_dir = secure_join(workspaces_dir, req.user_id, "sessions")
     os.makedirs(user_sessions_dir, exist_ok=True)
     index_file = os.path.join(user_sessions_dir, "sessions_index.json")
     
@@ -176,7 +206,7 @@ async def create_user_session(req: CreateSessionRequest):
 
 @app.post("/api/sessions/rename")
 async def rename_user_session(req: RenameSessionRequest):
-    user_sessions_dir = os.path.join(workspaces_dir, req.user_id, "sessions")
+    user_sessions_dir = secure_join(workspaces_dir, req.user_id, "sessions")
     index_file = os.path.join(user_sessions_dir, "sessions_index.json")
     if os.path.exists(index_file):
         try:
@@ -195,9 +225,9 @@ async def rename_user_session(req: RenameSessionRequest):
 
 @app.get("/api/sessions/{user_id}/{session_id}")
 async def get_session_details(user_id: str, session_id: str):
-    session_dir = os.path.join(workspaces_dir, user_id, "sessions", session_id)
+    session_dir = secure_join(workspaces_dir, user_id, "sessions", session_id)
     if not os.path.exists(session_dir):
-        session_dir = os.path.join(workspaces_dir, user_id)
+        session_dir = secure_join(workspaces_dir, user_id)
     
     res = {
         "app_code": "",
@@ -220,7 +250,7 @@ async def get_session_details(user_id: str, session_id: str):
 
 @app.delete("/api/sessions/{user_id}/{session_id}")
 async def delete_user_session(user_id: str, session_id: str):
-    user_sessions_dir = os.path.join(workspaces_dir, user_id, "sessions")
+    user_sessions_dir = secure_join(workspaces_dir, user_id, "sessions")
     index_file = os.path.join(user_sessions_dir, "sessions_index.json")
     session_dir = os.path.join(user_sessions_dir, session_id)
     
@@ -288,9 +318,9 @@ def parse_ast_tree(source_code: str):
 
 @app.get("/api/ast-tree/{user_id}/{session_id}")
 async def get_ast_tree(user_id: str, session_id: str):
-    session_dir = os.path.join(workspaces_dir, user_id, "sessions", session_id)
+    session_dir = secure_join(workspaces_dir, user_id, "sessions", session_id)
     if not os.path.exists(session_dir):
-        session_dir = os.path.join(workspaces_dir, user_id)
+        session_dir = secure_join(workspaces_dir, user_id)
     
     app_p = os.path.join(session_dir, "generated_app.py")
     code = ""
@@ -303,9 +333,9 @@ async def get_ast_tree(user_id: str, session_id: str):
 
 @app.get("/api/swarm/export-pdf/{user_id}/{session_id}")
 async def export_pdf_report(user_id: str, session_id: str):
-    session_dir = os.path.join(workspaces_dir, user_id, "sessions", session_id)
+    session_dir = secure_join(workspaces_dir, user_id, "sessions", session_id)
     if not os.path.exists(session_dir):
-        session_dir = os.path.join(workspaces_dir, user_id)
+        session_dir = secure_join(workspaces_dir, user_id)
 
     session_data = {
         "prompt": "DevSecOps Swarm Code Synthesis",
@@ -317,7 +347,7 @@ async def export_pdf_report(user_id: str, session_id: str):
         with open(vuln_p, "r") as f:
             session_data["vulnerability_report"] = f.read()
 
-    index_file = os.path.join(workspaces_dir, user_id, "sessions", "sessions_index.json")
+    index_file = secure_join(workspaces_dir, user_id, "sessions", "sessions_index.json")
     if os.path.exists(index_file):
         try:
             with open(index_file, "r") as f:
@@ -418,14 +448,14 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         active_websockets.remove(websocket)
 
-async def query_gemini_api(prompt_text: str, api_key: str):
+async def query_gemini_raw(full_text: str, api_key: str):
     if not api_key or not api_key.strip():
         return None, "No Gemini API Key provided! Please enter your API Key in the UI input box or set the GEMINI_API_KEY environment variable."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key.strip()}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key.strip()}"
     payload = {
         "contents": [{
             "parts": [{
-                "text": f"You are a Senior Security-Focused Python Architect. Build a highly professional, production-ready solution for this requirement: '{prompt_text}'. Use advanced object-oriented or functional patterns, strict type hinting, comprehensive docstrings, and robust error handling. Do NOT hardcode any test data or static execution blocks. You MUST build an interactive CLI loop (e.g. using 'while True:' and 'input()') so the user can interactively test all functionality. If the solution requires multiple files (like models.py, utils.py, etc.), you MUST delimit them exactly like this:\n\n$$FILE: filename.py$$\n<file content>\n$$FILE: nextfile.py$$\n<file content>\n\nIf it's just one file, you must still use $$FILE: generated_app.py$$. Output ONLY the raw delimited code, absolutely no markdown wrappers like ```python."
+                "text": full_text
             }]
         }]
     }
@@ -449,7 +479,49 @@ async def query_gemini_api(prompt_text: str, api_key: str):
         return None, str(e)
     return None, "Unknown API error"
 
-async def query_openrouter_api(prompt_text: str, api_key: str, model_name: str = "deepseek/deepseek-chat"):
+async def query_gemini_api(prompt_text: str, api_key: str):
+    return await query_gemini_raw(CODER_SYSTEM_PROMPT.format(prompt_text=prompt_text), api_key)
+
+CODER_SYSTEM_PROMPT = "You are a Senior Security-Focused Python Architect. Build a highly professional, production-ready solution for this requirement: '{prompt_text}'. Use advanced object-oriented or functional patterns, strict type hinting, comprehensive docstrings, and robust error handling. Do NOT hardcode any test data or static execution blocks. You MUST build an interactive CLI loop (e.g. using 'while True:' and 'input()') so the user can interactively test all functionality. All core logic MUST live in standalone functions/classes (not just inline in the CLI loop) so it can be unit tested directly. You MUST also provide a pytest test file, delimited as $$FILE: test_generated_app.py$$ — this is NOT optional and the tests must NOT be trivial placeholders like 'assert True'; each test function must call your actual functions with representative inputs and assert the exact expected output/behavior (e.g. assert evaluate('5+5') == 10), covering the core functionality described in the requirement plus at least one edge case. If the solution requires multiple files (like models.py, utils.py, etc.), you MUST delimit them exactly like this:\n\n$$FILE: filename.py$$\n<file content>\n$$FILE: nextfile.py$$\n<file content>\n\nIf it's just one file, you must still use $$FILE: generated_app.py$$. Output ONLY the raw delimited code, absolutely no markdown wrappers like ```python."
+
+async def query_claude_raw(full_text: str, api_key: str, model_name: str = "claude-sonnet-5"):
+    if not api_key or not api_key.strip():
+        return None, "No Anthropic API Key provided! Set the ANTHROPIC_API_KEY environment variable."
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "x-api-key": api_key.strip(),
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+    payload = {
+        "model": model_name,
+        "max_tokens": 8192,
+        "messages": [
+            {"role": "user", "content": full_text}
+        ]
+    }
+    try:
+        r = await asyncio.to_thread(requests.post, url, headers=headers, json=payload, timeout=60)
+        if r.status_code == 200:
+            res_json = r.json()
+            content_blocks = res_json.get("content", [])
+            if content_blocks:
+                text = content_blocks[0].get("text", "")
+                return text.strip(), None
+        elif r.status_code == 401:
+            return None, "HTTP 401 Unauthorized: Invalid Anthropic API Key."
+        elif r.status_code == 429:
+            return None, "HTTP 429 Rate Limit Exceeded: Your Anthropic API Key quota has been temporarily exhausted."
+        else:
+            return None, f"HTTP {r.status_code}: {r.text[:150]}"
+    except Exception as e:
+        return None, str(e)
+    return None, "Unknown API error"
+
+async def query_claude_api(prompt_text: str, api_key: str, model_name: str = "claude-sonnet-5"):
+    return await query_claude_raw(CODER_SYSTEM_PROMPT.format(prompt_text=prompt_text), api_key, model_name)
+
+async def query_openrouter_raw(full_text: str, api_key: str, model_name: str = "deepseek/deepseek-chat"):
     if not api_key or not api_key.strip():
         return None, "No OpenRouter API Key provided! Enter your API key in the UI input box."
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -463,12 +535,8 @@ async def query_openrouter_api(prompt_text: str, api_key: str, model_name: str =
         "model": model_name,
         "messages": [
             {
-                "role": "system",
-                "content": f"You are a Senior Security-Focused Python Architect. Build a highly professional, production-ready solution for this requirement: '{prompt_text}'. Use advanced object-oriented or functional patterns, strict type hinting, comprehensive docstrings, and robust error handling. Do NOT hardcode any test data or static execution blocks. You MUST build an interactive CLI loop (e.g. using 'while True:' and 'input()') so the user can interactively test all functionality. If the solution requires multiple files (like models.py, utils.py, etc.), you MUST delimit them exactly like this:\n\n$$FILE: filename.py$$\n<file content>\n$$FILE: nextfile.py$$\n<file content>\n\nIf it's just one file, you must still use $$FILE: generated_app.py$$. Output ONLY the raw delimited code, absolutely no markdown wrappers like ```python."
-            },
-            {
                 "role": "user",
-                "content": prompt_text
+                "content": full_text
             }
         ]
     }
@@ -496,7 +564,8 @@ async def query_ollama(prompt_text: str, model_name: str):
             requests.post,
             "http://localhost:11434/api/generate",
             json={"model": model_name, "prompt": prompt_text, "stream": False},
-            timeout=120
+            timeout=240  # Mandatory real tests + full app code is a lot for small local models to
+                         # generate — 120s was too tight and caused frequent false timeouts.
         )
         if r.status_code == 200:
             resp = r.json().get("response", "")
@@ -505,7 +574,345 @@ async def query_ollama(prompt_text: str, model_name: str):
         print("Ollama query error:", e)
     return None
 
-def generate_domain_code(prompt: str):
+# ── Multi-language pipeline support ─────────────────────────────────────────
+
+TOOLS_DIR = os.path.join(os.path.dirname(__file__), "tools")
+JUNIT_JAR = os.path.join(TOOLS_DIR, "junit-platform-console-standalone.jar")
+GSON_JAR = os.path.join(TOOLS_DIR, "gson.jar")
+JAVA_CLASSPATH = f"{JUNIT_JAR};{GSON_JAR}"
+
+LANGUAGE_CONFIG = {
+    "python": {"display": "Python", "ext": "py"},
+    "cpp": {"display": "C++", "ext": "cpp"},
+    "java": {"display": "Java", "ext": "java"},
+}
+
+def lang_ext(language: str) -> str:
+    return LANGUAGE_CONFIG.get(language, LANGUAGE_CONFIG["python"])["ext"]
+
+def lang_display(language: str) -> str:
+    return LANGUAGE_CONFIG.get(language, LANGUAGE_CONFIG["python"])["display"]
+
+def fix_java_class_visibility(code: str) -> str:
+    """Java requires a `public class X` to live in a file named X.java. Our pipeline always
+    writes to generated_app.java, so any top-level `public class` (which LLMs add despite
+    instructions not to) causes a guaranteed compile failure. Strip the modifier defensively
+    rather than relying on prompt compliance."""
+    import re
+    return re.sub(r"\bpublic\s+class\s+", "class ", code)
+
+def strip_code_fences(text: str) -> str:
+    import re
+    text = text.strip()
+    # Prefer an actual fenced code block anywhere in the response (handles models that
+    # add conversational preamble/postamble around the code instead of pure fenced output).
+    fence_match = re.search(r"```[a-zA-Z0-9+]*\n(.*?)```", text, re.DOTALL)
+    if fence_match:
+        return fence_match.group(1).strip()
+    # No fence found at all — strip any stray leading/trailing fence markers just in case.
+    text = re.sub(r"^```[a-zA-Z0-9+]*\n?", "", text)
+    text = re.sub(r"\n?```$", "", text)
+    return text.strip()
+
+SAST_TOOL_NAME = {"python": "Bandit", "cpp": "Cppcheck", "java": "Semgrep"}
+TEST_TOOL_NAME = {"python": "Pytest", "cpp": "Catch2", "java": "JUnit"}
+
+STUB_TEST_CODE = {
+    "python": "# Dynamic tests omitted to speed up demo\nimport pytest\n\ndef test_pass():\n    assert True\n",
+    "cpp": '#define CATCH_CONFIG_MAIN\n#include "catch.hpp"\n\nTEST_CASE("placeholder") {\n    REQUIRE(true);\n}\n',
+    "java": (
+        "import org.junit.jupiter.api.Test;\n"
+        "import static org.junit.jupiter.api.Assertions.assertTrue;\n\n"
+        "class GeneratedAppTest {\n"
+        "    @Test\n"
+        "    void placeholder() {\n"
+        "        assertTrue(true);\n"
+        "    }\n"
+        "}\n"
+    ),
+}
+
+CODER_PROMPTS = {
+    "python": CODER_SYSTEM_PROMPT,
+    "cpp": (
+        "You are a Senior Security-Focused C++ Architect. Build a highly professional, production-ready C++17 console "
+        "application solving this requirement: '{prompt_text}'. Requirements:\n"
+        "- Single file only, delimited exactly as $$FILE: generated_app.cpp$$\n"
+        "- All core logic MUST live in free functions or classes declared OUTSIDE of main() so they can be unit tested directly.\n"
+        "- Provide a normal 'int main() {{ ... }}' with an interactive std::cin loop calling your functions.\n"
+        "- You MUST also provide a Catch2 test file, delimited as $$FILE: test_generated_app.cpp$$ using '#define CATCH_CONFIG_MAIN' + '#include \"catch.hpp\"' + TEST_CASE(...) macros, declaring the functions under test with a matching prototype (do not re-include generated_app.cpp). "
+        "This is NOT optional and the tests must NOT be trivial placeholders like REQUIRE(true) — each TEST_CASE must call your actual functions with representative inputs and REQUIRE the exact expected output/behavior (e.g. REQUIRE(evaluate(\"5+5\") == 10)), covering the core functionality described in the requirement plus at least one edge case.\n"
+        "- Use robust error handling and input validation. Do NOT hardcode test data.\n"
+        "- If the requirement needs JSON, the nlohmann/json single-header library is available: #include \"nlohmann/json.hpp\" (use nlohmann::json).\n"
+        "- Output ONLY the raw delimited code, absolutely no markdown fences."
+    ),
+    "java": (
+        "You are a Senior Security-Focused Java Architect. Build a highly professional, production-ready Java (JDK 17+) "
+        "console application solving this requirement: '{prompt_text}'. Requirements:\n"
+        "- Single file only, delimited exactly as $$FILE: generated_app.java$$\n"
+        "- The top-level class MUST be named exactly GeneratedApp and declared WITHOUT the 'public' modifier (i.e. 'class GeneratedApp { ... }') "
+        "so the file can be saved as generated_app.java without Java's public-class-filename rule.\n"
+        "- All core logic MUST live in static methods on GeneratedApp (e.g. GeneratedApp.methodName(...)) so they can be unit tested directly.\n"
+        "- The 'public static void main(String[] args)' method with the interactive Scanner-based loop MUST be defined directly inside the GeneratedApp class itself — do NOT create a separate Main/Launcher/App class to hold it.\n"
+        "- You MUST also provide a JUnit 5 test file, delimited as $$FILE: test_generated_app.java$$ with a non-public class named exactly GeneratedAppTest. "
+        "This is NOT optional and the tests must NOT be trivial placeholders like assertTrue(true) — each @Test method must call your actual static methods with representative inputs and assertEquals the exact expected output/behavior (e.g. assertEquals(10, GeneratedApp.evaluate(\"5+5\"))), covering the core functionality described in the requirement plus at least one edge case.\n"
+        "- Use robust error handling and input validation. Do NOT hardcode test data.\n"
+        "- If the requirement needs JSON, the Gson library is available: import com.google.gson.Gson;\n"
+        "- Output ONLY the raw delimited code, absolutely no markdown fences."
+    ),
+}
+
+OLLAMA_CODER_PROMPTS = {
+    "python": (
+        "Write a complete, working Python script for: {prompt}\n\n"
+        "Rules:\n"
+        "- All core logic in standalone functions (not just inline in the CLI loop) so it's independently testable\n"
+        "- Use input() for ALL user data — never hardcode values\n"
+        "- Main menu with while True loop so user can keep using it\n"
+        "- try/except error handling on every operation\n"
+        "- Clean readable code under 120 lines\n"
+        "- You MUST also write a pytest test file. Do NOT use trivial placeholders like 'assert True' — each test must call your actual functions with representative inputs and assert the exact expected output (e.g. assert evaluate('5+5') == 10), covering the core functionality plus at least one edge case.\n"
+        "- Output using exactly this format, nothing else, no markdown fences:\n"
+        "$$FILE: generated_app.py$$\n<app code>\n$$FILE: test_generated_app.py$$\n<test code>"
+    ),
+    "cpp": (
+        "Write a complete, working C++17 console program for: {prompt}\n\n"
+        "Rules:\n"
+        "- All logic in free functions declared OUTSIDE main() so they're independently testable\n"
+        "- Provide a normal int main() {{ ... }} with an interactive std::cin-based loop so the user can keep using it\n"
+        "- try/catch and input validation on every operation\n"
+        "- Clean readable code under 150 lines\n"
+        "- You MUST also write a Catch2 test file ('#define CATCH_CONFIG_MAIN' + '#include \"catch.hpp\"' + TEST_CASE(...) macros, redeclaring the tested function prototypes, do not re-include the app file). Do NOT use trivial placeholders like REQUIRE(true) — each TEST_CASE must call your actual functions with representative inputs and REQUIRE the exact expected output (e.g. REQUIRE(evaluate(\"5+5\") == 10)), covering the core functionality plus at least one edge case.\n"
+        "- If you need JSON, the nlohmann/json single-header library is available: #include \"nlohmann/json.hpp\" (use nlohmann::json)\n"
+        "- Output using exactly this format, nothing else, no markdown fences:\n"
+        "$$FILE: generated_app.cpp$$\n<app code>\n$$FILE: test_generated_app.cpp$$\n<test code>"
+    ),
+    "java": (
+        "Write a complete, working Java (JDK 17+) console program for: {prompt}\n\n"
+        "Rules:\n"
+        "- Top-level class named exactly GeneratedApp, declared WITHOUT the 'public' modifier\n"
+        "- All logic in static methods on GeneratedApp so they're independently testable\n"
+        "- 'public static void main(String[] args)' defined directly inside the GeneratedApp class itself (do NOT create a separate Main/Launcher class for it), with an interactive Scanner-based loop\n"
+        "- try/catch and input validation on every operation\n"
+        "- Clean readable code under 150 lines\n"
+        "- You MUST also write a JUnit 5 test file with a non-public class named exactly GeneratedAppTest. Do NOT use trivial placeholders like assertTrue(true) — each @Test method must call your actual static methods with representative inputs and assertEquals the exact expected output (e.g. assertEquals(10, GeneratedApp.evaluate(\"5+5\"))), covering the core functionality plus at least one edge case.\n"
+        "- If you need JSON, the Gson library is available: import com.google.gson.Gson;\n"
+        "- Output using exactly this format, nothing else, no markdown fences:\n"
+        "$$FILE: generated_app.java$$\n<app code>\n$$FILE: test_generated_app.java$$\n<test code>"
+    ),
+}
+
+VULN_HEURISTICS = {
+    "python": lambda c: ("eval(" in c) or ('f"SELECT' in c) or ("f'SELECT" in c) or ('f"./uploads' in c),
+    "cpp": lambda c: ("strcpy(" in c) or ("system(" in c) or ("gets(" in c) or ("sprintf(" in c),
+    "java": lambda c: ("Runtime.getRuntime().exec(" in c) or ("createStatement()" in c and "+" in c),
+}
+
+async def run_compile_and_test(language: str, cwd: str, app_filename: str, test_filename: str):
+    """Returns (passed: bool, output: str)."""
+    if language == "python":
+        cmd = f"{sys.executable} -m pytest {test_filename} -v --tb=short"
+        code, out, err = await run_cmd(cmd, cwd=cwd)
+        return code == 0, f"$ pytest {test_filename} -v\n{out}{err}"
+
+    if language == "cpp":
+        # Rename the app's main() away during test compilation so it never conflicts with
+        # Catch2's own main() (CATCH_CONFIG_MAIN) — works regardless of how the app's main() is written.
+        app_obj_cmd = f'g++ -std=c++17 -Dmain=__app_main_disabled__ -I "{TOOLS_DIR}" -c "{app_filename}" -o app_under_test.o'
+        code, out, err = await run_cmd(app_obj_cmd, cwd=cwd)
+        if code != 0:
+            return False, f"$ {app_obj_cmd}\n[COMPILE ERROR]\n{out}{err}"
+        test_obj_cmd = f'g++ -std=c++17 -I "{TOOLS_DIR}" -c "{test_filename}" -o test_under_test.o'
+        code, out, err = await run_cmd(test_obj_cmd, cwd=cwd)
+        if code != 0:
+            return False, f"$ {test_obj_cmd}\n[COMPILE ERROR]\n{out}{err}"
+        link_cmd = "g++ -o tests.exe app_under_test.o test_under_test.o"
+        code, out, err = await run_cmd(link_cmd, cwd=cwd)
+        if code != 0:
+            return False, f"$ {link_cmd}\n[LINK ERROR]\n{out}{err}"
+        run_code, run_out, run_err = await run_cmd(".\\tests.exe", cwd=cwd)
+        return run_code == 0, f"$ {app_obj_cmd}\n$ {test_obj_cmd}\n$ {link_cmd}\n$ .\\tests.exe\n{run_out}{run_err}"
+
+    if language == "java":
+        compile_cmd = f'javac -cp "{JAVA_CLASSPATH}" "{app_filename}" "{test_filename}"'
+        code, out, err = await run_cmd(compile_cmd, cwd=cwd)
+        if code != 0:
+            return False, f"$ {compile_cmd}\n[COMPILE ERROR]\n{out}{err}"
+        run_cmd_str = f'java -jar "{JUNIT_JAR}" -cp ".;{GSON_JAR}" --select-class GeneratedAppTest --disable-banner --disable-ansi-colors'
+        run_code, run_out, run_err = await run_cmd(run_cmd_str, cwd=cwd)
+        return run_code == 0, f"$ {compile_cmd}\n$ {run_cmd_str}\n{run_out}{run_err}"
+
+    return True, "[No test runner configured for this language]"
+
+async def run_sast(language: str, cwd: str, app_filename: str, sec_report_file: str):
+    """Returns list of {issue_text, severity, confidence, line} dicts.
+    Only includes findings severe enough to be genuine security/correctness concerns —
+    pure code-style/performance nits are excluded so the Patcher loop doesn't get stuck
+    trying to "fix" non-security suggestions."""
+    vulnerabilities = []
+    if language == "python":
+        cmd = f"{sys.executable} -m bandit -f json -o security_report.json {app_filename}"
+        await run_cmd(cmd, cwd=cwd)
+        if os.path.exists(sec_report_file):
+            try:
+                with open(sec_report_file, "r") as f:
+                    data = json.load(f)
+                for item in data.get("results", []):
+                    if (item.get("issue_severity") or "").upper() == "LOW":
+                        continue
+                    vulnerabilities.append({
+                        "issue_text": item.get("issue_text"),
+                        "severity": item.get("issue_severity"),
+                        "confidence": item.get("issue_confidence"),
+                        "line": item.get("line_number"),
+                    })
+            except Exception:
+                pass
+
+    elif language == "cpp":
+        cmd = f'cppcheck --enable=warning,style,performance,portability --xml --xml-version=2 "{app_filename}"'
+        code, out, err = await run_cmd(cmd, cwd=cwd)
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(err if "<results" in err else out)
+            for err_el in root.findall(".//error"):
+                severity = err_el.get("severity")
+                if severity not in ("error", "warning"):
+                    continue
+                loc = err_el.find("location")
+                vulnerabilities.append({
+                    "issue_text": err_el.get("msg"),
+                    "severity": severity,
+                    "confidence": "MEDIUM",
+                    "line": loc.get("line") if loc is not None else None,
+                })
+        except Exception:
+            pass
+
+    elif language == "java":
+        cmd = f'semgrep --config=p/security-audit --json -o security_report.json "{app_filename}"'
+        await run_cmd(cmd, cwd=cwd)
+        if os.path.exists(sec_report_file):
+            try:
+                with open(sec_report_file, "r") as f:
+                    data = json.load(f)
+                for item in data.get("results", []):
+                    severity = (item.get("extra", {}).get("severity") or "").upper()
+                    if severity == "INFO":
+                        continue
+                    vulnerabilities.append({
+                        "issue_text": item.get("check_id"),
+                        "severity": severity,
+                        "confidence": "MEDIUM",
+                        "line": item.get("start", {}).get("line"),
+                    })
+            except Exception:
+                pass
+    app_file_path = os.path.join(cwd, app_filename)
+    if os.path.exists(app_file_path):
+        with open(app_file_path, "r", encoding="utf-8") as f:
+            lines = f.read().split("\n")
+        
+        heuristics = {
+            "python": [("eval(", "eval() is dangerous"), ('f"SELECT', "SQL Injection"), ("f'SELECT", "SQL Injection"), ('f"./uploads', "Path traversal")],
+            "cpp": [("strcpy(", "Buffer overflow risk (strcpy)"), ("system(", "Command injection (system)"), ("gets(", "Buffer overflow risk (gets)"), ("sprintf(", "Buffer overflow risk (sprintf)")],
+            "java": [("Runtime.getRuntime().exec(", "Command injection"), ("createStatement(", "SQL Injection risk")]
+        }
+        for i, line in enumerate(lines):
+            for pattern, desc in heuristics.get(language, []):
+                if pattern in line:
+                    vulnerabilities.append({
+                        "issue_text": f"{desc} -> found '{pattern}'",
+                        "severity": "HIGH",
+                        "confidence": "HIGH",
+                        "line": i + 1,
+                    })
+
+    return vulnerabilities
+
+def find_java_main_class(code: str) -> str:
+    """LLMs don't always put `main` inside the class we asked for (GeneratedApp) — sometimes
+    they add a separate 'Main' class instead, despite instructions. Detect whichever top-level
+    class actually contains `static void main` rather than assuming, so the run command targets
+    the real entry point. Falls back to GeneratedApp if none found.
+
+    Uses proper brace-depth matching (not naive slicing between `class` keywords) so a nested
+    class defined before main() inside the same top-level class doesn't get misattributed."""
+    import re
+    n = len(code)
+    i = 0
+    depth = 0
+    top_level_bodies = []  # (name, full_body_including_braces)
+    class_kw_re = re.compile(r"\bclass\s+(\w+)")
+    while i < n:
+        if depth == 0:
+            m = class_kw_re.match(code, i)
+            if m:
+                brace_start = code.find("{", m.end())
+                if brace_start == -1:
+                    break
+                j = brace_start
+                d = 0
+                while j < n:
+                    if code[j] == "{":
+                        d += 1
+                    elif code[j] == "}":
+                        d -= 1
+                        if d == 0:
+                            break
+                    j += 1
+                top_level_bodies.append((m.group(1), code[brace_start:j + 1]))
+                i = j + 1
+                continue
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+        i += 1
+    for name, body in top_level_bodies:
+        if re.search(r"\bstatic\s+void\s+main\s*\(", body):
+            return name
+    return "GeneratedApp"
+
+async def compile_for_run(language: str, cwd: str, app_filename: str):
+    """Compiles (if needed) and returns (ok, argv_to_spawn, error_output)."""
+    if language == "cpp":
+        # Unique output name per compile: a previous run's .exe can still be locked by
+        # Windows (process still alive, antivirus scan, etc.), which fails a fixed-name
+        # rebuild with "Permission Denied" even though the source itself is fine.
+        exe_name = f"app_run_{uuid.uuid4().hex[:8]}.exe"
+        compile_cmd = f'g++ -std=c++17 -I "{TOOLS_DIR}" -o {exe_name} "{app_filename}"'
+        code, out, err = await run_cmd(compile_cmd, cwd=cwd)
+        if code != 0:
+            return False, None, f"$ {compile_cmd}\n[COMPILE ERROR]\n{out}{err}"
+        return True, [os.path.join(cwd, exe_name)], ""
+
+    if language == "java":
+        compile_cmd = f'javac -cp "{GSON_JAR}" "{app_filename}"'
+        code, out, err = await run_cmd(compile_cmd, cwd=cwd)
+        if code != 0:
+            return False, None, f"$ {compile_cmd}\n[COMPILE ERROR]\n{out}{err}"
+        try:
+            with open(os.path.join(cwd, app_filename), "r", encoding="utf-8") as f:
+                main_class = find_java_main_class(f.read())
+        except Exception:
+            main_class = "GeneratedApp"
+        return True, ["java", "-cp", f"{cwd};{GSON_JAR}", main_class], ""
+
+    return True, [sys.executable, "-u", app_filename], ""
+
+def generate_domain_code(prompt: str, language: str = "python"):
+    if language == "cpp":
+        initial_code = '#include <iostream>\nusing namespace std;\nint main() { cout << "Auto App C++\\n"; system("echo vulnerable"); return 0; }\n'
+        test_code = '#define CATCH_CONFIG_MAIN\n#include "catch.hpp"\nTEST_CASE("AutoApp") { REQUIRE(1 == 1); }\n'
+        patched_code = '#include <iostream>\nusing namespace std;\nint main() { cout << "Auto App C++\\n"; return 0; }\n'
+        return initial_code, test_code, patched_code, "Command Injection", "Usage of system() detected."
+    if language == "java":
+        initial_code = 'public class generated_app {\n    public static void main(String[] args) throws Exception {\n        System.out.println("Auto App Java");\n        Runtime.getRuntime().exec("echo vulnerable");\n    }\n}\n'
+        test_code = 'import org.junit.Test;\nimport static org.junit.Assert.*;\npublic class test_generated_app {\n    @Test\n    public void testApp() {\n        assertTrue(true);\n    }\n}\n'
+        patched_code = 'public class generated_app {\n    public static void main(String[] args) {\n        System.out.println("Auto App Java");\n    }\n}\n'
+        return initial_code, test_code, patched_code, "Command Injection", "Usage of Runtime.getRuntime().exec() detected."
+
     p = prompt.lower()
 
     # 1. TO-DO LIST INTERACTIVE APPLICATION
@@ -1588,8 +1995,14 @@ async def stream_interactive_process(proc, process_id: str, user_id: str, sessio
     active_processes.pop(process_id, None)
     await broadcast({"type": "PROCESS_DONE", "exit_code": proc.returncode, "process_id": process_id, "user_id": user_id, "session_id": session_id})
 
-async def execute_run_and_debug(code: str, user_id: str = "default_user", session_id: str = None, selected_model: str = None, max_attempts: int = 3):
-    user_dir = os.path.join(workspaces_dir, user_id)
+async def execute_run_and_debug(code: str, user_id: str = "default_user", session_id: str = None, selected_model: str = None, max_attempts: int = 2, language: str = "python"):
+    if language not in LANGUAGE_CONFIG:
+        language = "python"
+    if language == "java":
+        code = fix_java_class_visibility(code)
+    app_filename = f"generated_app.{lang_ext(language)}"
+
+    user_dir = secure_join(workspaces_dir, user_id)
     os.makedirs(user_dir, exist_ok=True)
 
     session_target_dir = user_dir
@@ -1597,10 +2010,20 @@ async def execute_run_and_debug(code: str, user_id: str = "default_user", sessio
         session_target_dir = os.path.join(user_dir, "sessions", session_id)
         os.makedirs(session_target_dir, exist_ok=True)
 
-    app_file = os.path.join(session_target_dir, "generated_app.py")
-    root_app_file = os.path.join(user_dir, "generated_app.py")
+    app_file = os.path.join(session_target_dir, app_filename)
+    root_app_file = os.path.join(user_dir, app_filename)
 
     use_api_key_mode = is_api_key_model(selected_model)
+    is_claude_model = bool(selected_model) and selected_model.lower() == CLAUDE_API_KEY_MODEL.lower()
+    is_openrouter_model = bool(selected_model) and selected_model.lower() == OPENROUTER_API_KEY_MODEL.lower()
+    
+    if is_claude_model:
+        api_key_to_use = PROVIDED_ANTHROPIC_API_KEY
+    elif is_openrouter_model:
+        api_key_to_use = PROVIDED_OPENROUTER_API_KEY
+    else:
+        api_key_to_use = PROVIDED_API_KEY
+
     is_auto_run = not selected_model or selected_model.lower() in ["auto", "auto-detect / dynamic synthesizer"]
     ollama_model = selected_model if selected_model and not use_api_key_mode and not is_auto_run else None
     has_autofix_model = use_api_key_mode or bool(ollama_model)
@@ -1615,15 +2038,29 @@ async def execute_run_and_debug(code: str, user_id: str = "default_user", sessio
         with open(root_app_file, "w") as f: f.write(current_code)
         await broadcast({"type": "FILE_UPDATE", "file": "app.py", "content": current_code, "user_id": user_id, "session_id": session_id})
 
-        await broadcast({"type": "LOG", "agent": "runner", "text": f"[Run Agent] Attempt {attempt}/{attempts_allowed}: Executing generated_app.py locally..."})
+        await broadcast({"type": "LOG", "agent": "runner", "text": f"[Run Agent] Attempt {attempt}/{attempts_allowed}: Executing {app_filename} locally..."})
 
-        try:
-            result = await asyncio.to_thread(subprocess.run, [sys.executable, "generated_app.py"], capture_output=True, text=True, cwd=session_target_dir, timeout=15)
-            ret_code, out, err = result.returncode, result.stdout, result.stderr
-        except Exception as e:
-            ret_code, out, err = -1, "", str(e)
+        timed_out = False
+        ok, argv, compile_err = await compile_for_run(language, session_target_dir, app_filename)
+        if not ok:
+            ret_code, out, err = 1, "", compile_err
+            run_cmd_label = f"compile {app_filename}"
+        else:
+            run_cmd_label = " ".join(argv)
+            try:
+                # input="" closes stdin immediately (EOF) instead of leaving it unset, which
+                # otherwise silently blocks for the full timeout on any program that reads
+                # user input (cin/input()/Scanner) — well-written interactive loops treat EOF
+                # as "no more input" and exit/error immediately instead of hanging.
+                result = await asyncio.to_thread(subprocess.run, argv, input="", capture_output=True, text=True, cwd=session_target_dir, timeout=15)
+                ret_code, out, err = result.returncode, result.stdout, result.stderr
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                ret_code, out, err = -1, "", "Timed out after 15s waiting for more input than an empty stdin provides."
+            except Exception as e:
+                ret_code, out, err = -1, "", str(e)
 
-        await broadcast({"type": "TERMINAL_OUTPUT", "cmd": "python generated_app.py", "output": (out + err).strip() or "(no output)", "user_id": user_id, "session_id": session_id})
+        await broadcast({"type": "TERMINAL_OUTPUT", "cmd": run_cmd_label, "output": (out + err).strip() or "(no output)", "user_id": user_id, "session_id": session_id})
 
         if ret_code == 0:
             await broadcast({"type": "LOG", "agent": "runner", "text": "[Run Agent] Execution completed successfully — no runtime errors detected."})
@@ -1631,7 +2068,16 @@ async def execute_run_and_debug(code: str, user_id: str = "default_user", sessio
             await broadcast({"type": "RUN_COMPLETE", "status": "SUCCESS", "attempts": attempt, "user_id": user_id, "session_id": session_id})
             return
 
-        await broadcast({"type": "LOG", "agent": "runner", "text": f"[Run Agent] Runtime error detected (exit code {ret_code})."})
+        if timed_out:
+            # Not something an AI fix can meaningfully resolve — the code likely just expects
+            # more interactive input than this quick check provides. Retrying or asking the AI
+            # to "fix" it would just risk it adding hacky EOF-handling that breaks real usage.
+            await broadcast({"type": "LOG", "agent": "runner", "text": "[Run Agent] Program is waiting for more input than this quick check provides — this doesn't necessarily mean the code is broken. Use \"▶ Interactive Run\" to test it with real input instead."})
+            await broadcast({"type": "AGENT_END", "agent": "runner", "status": "FAILED", "user_id": user_id, "session_id": session_id})
+            await broadcast({"type": "RUN_COMPLETE", "status": "INCONCLUSIVE", "attempts": attempt, "user_id": user_id, "session_id": session_id})
+            return
+
+        await broadcast({"type": "LOG", "agent": "runner", "text": f"[Run Agent] Error detected (exit code {ret_code})."})
         await broadcast({"type": "AGENT_END", "agent": "runner", "status": "FAILED", "user_id": user_id, "session_id": session_id})
 
         if attempt == attempts_allowed:
@@ -1639,22 +2085,33 @@ async def execute_run_and_debug(code: str, user_id: str = "default_user", sessio
 
         await broadcast({"type": "AGENT_START", "agent": "debugger", "title": "Debugger Agent (Auto-Fix)", "user_id": user_id, "session_id": session_id})
         fix_prompt = (
-            f"The following Python script raised an error when executed:\n\n{current_code}\n\n"
-            f"ERROR OUTPUT:\n{err.strip()[-2000:]}\n\n"
-            f"Fix the bug and return the COMPLETE corrected Python script only. No explanation, no markdown fences."
+            f"The following {lang_display(language)} program raised an error when executed:\n\n{current_code}\n\n"
+            f"ERROR OUTPUT:\n{(out + err).strip()[-2000:]}\n\n"
+            f"Fix the bug and return the COMPLETE corrected {lang_display(language)} program only. No explanation, no markdown fences."
         )
 
-        fixed_code = None
+        fixed_res = None
         if use_api_key_mode:
-            await broadcast({"type": "LOG", "agent": "debugger", "text": "[Debugger Agent] Requesting fix from Gemini 2.0 Flash API..."})
-            fixed_code, gem_err = await query_gemini_api(fix_prompt, PROVIDED_API_KEY)
-            if not fixed_code:
-                await broadcast({"type": "LOG", "agent": "debugger", "text": f"[Debugger Agent] Gemini fix unavailable ({gem_err})."})
+            if is_claude_model:
+                await broadcast({"type": "LOG", "agent": "debugger", "text": "[Debugger Agent] Requesting fix from Claude API..."})
+                fixed_res, api_err = await query_claude_raw(fix_prompt, api_key_to_use)
+            elif is_openrouter_model:
+                await broadcast({"type": "LOG", "agent": "debugger", "text": "[Debugger Agent] Requesting fix from OpenRouter API..."})
+                fixed_res, api_err = await query_openrouter_raw(fix_prompt, api_key_to_use)
+            else:
+                await broadcast({"type": "LOG", "agent": "debugger", "text": "[Debugger Agent] Requesting fix from Gemini API..."})
+                fixed_res, api_err = await query_gemini_raw(fix_prompt, api_key_to_use)
+            if not fixed_res:
+                await broadcast({"type": "LOG", "agent": "debugger", "text": f"[Debugger Agent] API fix unavailable ({api_err})."})
         elif ollama_model:
             await broadcast({"type": "LOG", "agent": "debugger", "text": f"[Debugger Agent] Requesting fix from local Ollama model ({ollama_model})..."})
-            fixed_code = await query_ollama(fix_prompt, ollama_model)
-            if not fixed_code:
+            fixed_res = await query_ollama(fix_prompt, ollama_model)
+            if not fixed_res:
                 await broadcast({"type": "LOG", "agent": "debugger", "text": "[Debugger Agent] Ollama fix unavailable."})
+
+        fixed_code = strip_code_fences(fixed_res) if fixed_res else None
+        if fixed_code and language == "java":
+            fixed_code = fix_java_class_visibility(fixed_code)
 
         if not fixed_code or fixed_code.strip() == current_code.strip():
             await broadcast({"type": "LOG", "agent": "debugger", "text": "[Debugger Agent] No automatic fix could be generated."})
@@ -1666,15 +2123,21 @@ async def execute_run_and_debug(code: str, user_id: str = "default_user", sessio
         current_code = fixed_code
 
     if not has_autofix_model:
-        await broadcast({"type": "LOG", "agent": "runner", "text": "[Run Agent] No AI model selected, so auto-debug is unavailable. Select an Ollama model or the Gemini API option in the model dropdown to enable automatic fixing."})
+        await broadcast({"type": "LOG", "agent": "runner", "text": "[Run Agent] No AI model selected, so auto-debug is unavailable. Select an Ollama model or an API model in the model dropdown to enable automatic fixing."})
 
     await broadcast({"type": "LOG", "agent": "runner", "text": f"[Run Agent] Stopped after {attempts_allowed} attempt(s). Manual review required."})
     await broadcast({"type": "RUN_COMPLETE", "status": "FAILED", "attempts": attempts_allowed, "user_id": user_id, "session_id": session_id})
 
-async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_model: str = None, user_id: str = "default_user", session_id: str = None, api_key: str = None):
-    global active_workflow_state
-    
-    user_dir = os.path.join(workspaces_dir, user_id)
+async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_model: str = None, user_id: str = "default_user", session_id: str = None, api_key: str = None, language: str = "python"):
+    state = get_workflow_state(user_id, session_id)
+
+    if language not in LANGUAGE_CONFIG:
+        language = "python"
+    ext = lang_ext(language)
+    app_filename = f"generated_app.{ext}"
+    test_filename = f"test_generated_app.{ext}"
+
+    user_dir = secure_join(workspaces_dir, user_id)
     os.makedirs(user_dir, exist_ok=True)
 
     session_target_dir = user_dir
@@ -1696,18 +2159,18 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
             except Exception:
                 pass
 
-    app_file = os.path.join(session_target_dir, "generated_app.py")
-    test_file = os.path.join(session_target_dir, "test_generated_app.py")
+    app_file = os.path.join(session_target_dir, app_filename)
+    test_file = os.path.join(session_target_dir, test_filename)
     vuln_file = os.path.join(session_target_dir, "vulnerability_report.md")
     sec_report_file = os.path.join(session_target_dir, "security_report.json")
 
-    root_app_file = os.path.join(user_dir, "generated_app.py")
-    root_test_file = os.path.join(user_dir, "test_generated_app.py")
+    root_app_file = os.path.join(user_dir, app_filename)
+    root_test_file = os.path.join(user_dir, test_filename)
 
-    active_workflow_state["max_loops"] = max_loops
-    active_workflow_state["current_loop"] = 0
-    active_workflow_state["is_running"] = True
-    active_workflow_state["selected_model"] = selected_model
+    state["max_loops"] = max_loops
+    state["current_loop"] = 0
+    state["is_running"] = True
+    state["selected_model"] = selected_model
 
     use_api_key_mode = is_api_key_model(selected_model)
     is_auto = not selected_model or selected_model.lower() in ["auto", "auto-detect / dynamic synthesizer"]
@@ -1726,78 +2189,106 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
 
     ollama_model = auto_ollama_model if is_auto else (selected_model if selected_model and not use_api_key_mode and not is_auto else None)
 
-    api_key_to_use = PROVIDED_API_KEY
+    is_claude_model = bool(selected_model) and selected_model.lower() == CLAUDE_API_KEY_MODEL.lower()
+    is_openrouter_model = bool(selected_model) and selected_model.lower() == OPENROUTER_API_KEY_MODEL.lower()
+    
+    if is_claude_model:
+        api_key_to_use = PROVIDED_ANTHROPIC_API_KEY
+    elif is_openrouter_model:
+        api_key_to_use = PROVIDED_OPENROUTER_API_KEY
+    else:
+        api_key_to_use = PROVIDED_API_KEY
 
-    await broadcast({"type": "STATUS", "message": f"DevSecOps Swarm active for prompt: '{prompt}' (Model: {selected_model})", "state": "RUNNING", "user_id": user_id, "session_id": session_id})
+    await broadcast({"type": "STATUS", "message": f"DevSecOps Swarm active for prompt: '{prompt}' (Model: {selected_model}, Language: {lang_display(language)})", "state": "RUNNING", "user_id": user_id, "session_id": session_id})
+    secure_offline_patch = None
     await asyncio.sleep(0.3)
 
     # AGENT 1: CODER AGENT
     await broadcast({"type": "AGENT_START", "agent": "coder", "title": "Coder Agent (Developer)", "user_id": user_id, "session_id": session_id})
 
     if use_api_key_mode:
-        await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Querying Gemini 2.0 Flash API..."})
-        gemini_code, err_msg = await query_gemini_api(prompt, api_key_to_use)
+        coder_full_prompt = CODER_PROMPTS[language].format(prompt_text=prompt)
+        if is_claude_model:
+            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Querying Claude API..."})
+            gemini_code, err_msg = await query_claude_raw(coder_full_prompt, api_key_to_use)
+        elif is_openrouter_model:
+            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Querying OpenRouter API..."})
+            gemini_code, err_msg = await query_openrouter_raw(coder_full_prompt, api_key_to_use)
+        else:
+            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Querying Gemini API..."})
+            gemini_code, err_msg = await query_gemini_raw(coder_full_prompt, api_key_to_use)
 
         if gemini_code:
-            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] LIVE GENERATION SUCCESS: Generated real Python code via AI API!"})
-            initial_code = parse_multifile_response(gemini_code, session_target_dir)
-            test_file_path = os.path.join(session_target_dir, "test_generated_app.py")
+            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] LIVE GENERATION SUCCESS: Generated real {lang_display(language)} code via AI API!"})
+            initial_code = parse_multifile_response(gemini_code, session_target_dir, main_filename=app_filename)
+            if language == "java":
+                initial_code = fix_java_class_visibility(initial_code)
+            test_file_path = os.path.join(session_target_dir, test_filename)
             if os.path.exists(test_file_path):
                 with open(test_file_path, "r", encoding="utf-8") as f:
                     test_code = f.read()
+                if language == "java":
+                    test_code = fix_java_class_visibility(test_code)
+                    with open(test_file_path, "w", encoding="utf-8") as f: f.write(test_code)
             else:
-                test_code = "# Dynamic tests omitted to speed up demo\nimport pytest\n\ndef test_pass():\n    assert True"
+                test_code = STUB_TEST_CODE[language]
                 with open(test_file_path, "w", encoding="utf-8") as f: f.write(test_code)
             patched_code = initial_code
             vuln_type = "Potential Security Misconfiguration"
-            vuln_desc = "Bandit scanner enforces best practices. Please review."
+            vuln_desc = f"{SAST_TOOL_NAME[language]} scanner enforces best practices. Please review."
         else:
             await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] API ERROR: {err_msg}"})
             await broadcast({"type": "STATUS", "message": f"API Error: {err_msg}", "state": "ERROR", "user_id": user_id, "session_id": session_id})
             await broadcast({"type": "AGENT_END", "agent": "coder", "status": "FAILED", "user_id": user_id, "session_id": session_id})
             await broadcast({"type": "PIPELINE_COMPLETE", "message": f"API Error: {err_msg}", "user_id": user_id, "session_id": session_id})
-            active_workflow_state["is_running"] = False
+            state["is_running"] = False
             return
     elif ollama_model:
         await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Querying local Ollama model ({ollama_model}) for prompt: '{prompt}'..."})
-        coder_prompt = (
-            f"Write a complete, working Python script for: {prompt}\n\n"
-            f"Rules:\n"
-            f"- Use input() for ALL user data — never hardcode values\n"
-            f"- Main menu with while True loop so user can keep using it\n"
-            f"- try/except error handling on every operation\n"
-            f"- Clean readable code under 120 lines\n"
-            f"- Output ONLY the Python code — no explanations, no markdown fences\n\n"
-            f"Python code:"
-        )
+        coder_prompt = OLLAMA_CODER_PROMPTS[language].format(prompt=prompt)
         generated_code = await query_ollama(coder_prompt, ollama_model)
         if generated_code:
-            # Strip markdown fences if model added them
-            code_clean = generated_code.strip()
-            if "```python" in code_clean:
-                code_clean = code_clean.split("```python")[1].split("```")[0].strip()
-            elif "```" in code_clean:
-                code_clean = code_clean.split("```")[1].split("```")[0].strip()
-            initial_code = code_clean
+            initial_code = parse_multifile_response(generated_code, session_target_dir, main_filename=app_filename)
+            if language == "java":
+                initial_code = fix_java_class_visibility(initial_code)
 
-            # Write the cleaned code to disk
-            with open(os.path.join(session_target_dir, "generated_app.py"), "w", encoding="utf-8") as f:
+            # Re-write app file in case fix_java_class_visibility changed it after parse_multifile_response already wrote it
+            with open(os.path.join(session_target_dir, app_filename), "w", encoding="utf-8") as f:
                 f.write(initial_code)
 
-            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] LIVE GENERATION SUCCESS: Generated real Python code via Ollama!"})
-            test_file_path = os.path.join(session_target_dir, "test_generated_app.py")
-            test_code = "import pytest\n\ndef test_pass():\n    assert True\n"
-            with open(test_file_path, "w", encoding="utf-8") as f: f.write(test_code)
+            await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] LIVE GENERATION SUCCESS: Generated real {lang_display(language)} code via Ollama!"})
+            test_file_path = os.path.join(session_target_dir, test_filename)
+            if os.path.exists(test_file_path):
+                with open(test_file_path, "r", encoding="utf-8") as f:
+                    test_code = f.read()
+                if language == "java":
+                    test_code = fix_java_class_visibility(test_code)
+                    with open(test_file_path, "w", encoding="utf-8") as f: f.write(test_code)
+            else:
+                test_code = STUB_TEST_CODE[language]
+                with open(test_file_path, "w", encoding="utf-8") as f: f.write(test_code)
             patched_code = initial_code
             vuln_type = "Potential Security Misconfiguration"
-            vuln_desc = "Bandit scanner enforces best practices. Please review."
+            vuln_desc = f"{SAST_TOOL_NAME[language]} scanner enforces best practices. Please review."
         else:
             err_msg = "Ollama returned an empty response or crashed."
             await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Ollama Model Notice ({err_msg}). Switching to High-Reliability Code Synthesizer."})
-            initial_code, test_code, patched_code, vuln_type, vuln_desc = generate_domain_code(prompt)
+            initial_code, test_code, secure_offline_patch, vuln_type, vuln_desc = generate_domain_code(prompt, language)
+            patched_code = initial_code
+            ext = lang_ext(language); app_filename = f"generated_app.{ext}"; test_filename = f"test_generated_app.{ext}"
+            app_file = os.path.join(session_target_dir, app_filename)
+            test_file = os.path.join(session_target_dir, test_filename)
+            root_app_file = os.path.join(user_dir, app_filename)
+            root_test_file = os.path.join(user_dir, test_filename)
     else:
-        await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] [Autonomous Code Synthesizer] Synthesizing functional Python code for: '{prompt}'..."})
-        initial_code, test_code, patched_code, vuln_type, vuln_desc = generate_domain_code(prompt)
+        await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] [Autonomous Code Synthesizer] Synthesizing functional {lang_display(language)} code for: '{prompt}'..."})
+        initial_code, test_code, secure_offline_patch, vuln_type, vuln_desc = generate_domain_code(prompt, language)
+        patched_code = initial_code
+        ext = lang_ext(language); app_filename = f"generated_app.{ext}"; test_filename = f"test_generated_app.{ext}"
+        app_file = os.path.join(session_target_dir, app_filename)
+        test_file = os.path.join(session_target_dir, test_filename)
+        root_app_file = os.path.join(user_dir, app_filename)
+        root_test_file = os.path.join(user_dir, test_filename)
 
     # Stream code in chunks of 10 lines for fast display
     lines = initial_code.split("\n")
@@ -1816,28 +2307,65 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
     await broadcast({"type": "LOG", "agent": "coder", "text": f"[Coder Agent] Code for '{prompt}' successfully generated and saved."})
     await broadcast({"type": "AGENT_END", "agent": "coder", "status": "SUCCESS", "user_id": user_id, "session_id": session_id})
 
-    while active_workflow_state["current_loop"] < active_workflow_state["max_loops"]:
-        active_workflow_state["current_loop"] += 1
-        current_loop = active_workflow_state["current_loop"]
-        max_loops_curr = active_workflow_state["max_loops"]
+    while state["current_loop"] < state["max_loops"]:
+        state["current_loop"] += 1
+        current_loop = state["current_loop"]
+        max_loops_curr = state["max_loops"]
 
         await broadcast({"type": "LOOP_START", "loop": current_loop, "max_loops": max_loops_curr, "user_id": user_id, "session_id": session_id})
 
         # AGENT 2: TESTER AGENT
         await broadcast({"type": "AGENT_START", "agent": "tester", "title": "Tester Agent (QA Verification)", "user_id": user_id, "session_id": session_id})
-        await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] Executing pytest test suite against generated_app.py..."})
+        await broadcast({"type": "LOG", "agent": "tester", "text": f"[Tester Agent] Executing {TEST_TOOL_NAME[language]} test suite against {app_filename}..."})
 
-        cmd_pytest = f"{sys.executable} -m pytest test_generated_app.py -v --tb=short"
-        code, out, err = await run_cmd(cmd_pytest, cwd=session_target_dir)
+        tests_passed, test_output = await run_compile_and_test(language, session_target_dir, app_filename, test_filename)
 
-        await broadcast({"type": "TERMINAL_OUTPUT", "cmd": "pytest test_generated_app.py -v", "output": out + err, "user_id": user_id, "session_id": session_id})
+        await broadcast({"type": "TERMINAL_OUTPUT", "cmd": f"{TEST_TOOL_NAME[language]} run", "output": test_output, "user_id": user_id, "session_id": session_id})
 
-        if code != 0:
-            await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] Unit tests failed! Patching code to fix test failure..."})
+        if not tests_passed:
+            await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] Unit tests failed! Requesting AI fix for the specific error..."})
             await broadcast({"type": "AGENT_END", "agent": "tester", "status": "FAILED", "user_id": user_id, "session_id": session_id})
+
+            fix_prompt = (
+                f"This {lang_display(language)} program failed to compile or pass its test suite.\n\n"
+                f"CODE:\n{patched_code}\n\n"
+                f"ERROR OUTPUT:\n{test_output.strip()[-2500:]}\n\n"
+                f"Fix the bug. Make the MINIMAL change needed to resolve exactly this error — do not rewrite unrelated code.\n"
+                f"Return ONLY the COMPLETE fixed {lang_display(language)} program, no explanations, no markdown fences."
+            )
+            fixed_res = None
+            if ollama_model:
+                fixed_res = await query_ollama(fix_prompt, ollama_model)
+            elif use_api_key_mode:
+                if is_claude_model:
+                    fixed_res, _ = await query_claude_raw(fix_prompt, api_key_to_use)
+                elif is_openrouter_model:
+                    fixed_res, _ = await query_openrouter_raw(fix_prompt, api_key_to_use)
+                else:
+                    fixed_res, _ = await query_gemini_raw(fix_prompt, api_key_to_use)
+
+            made_progress = False
+            if fixed_res:
+                fixed_code = strip_code_fences(fixed_res)
+                if language == "java":
+                    fixed_code = fix_java_class_visibility(fixed_code)
+                if fixed_code.strip() and fixed_code.strip() != patched_code.strip():
+                    patched_code = fixed_code
+                    made_progress = True
+                    await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] AI fix generated. Retrying..."})
+                else:
+                    await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] AI returned unchanged code — no further fix possible, stopping early to save API calls."})
+            else:
+                await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] No AI model available to auto-fix this error."})
+
             with open(app_file, "w", encoding="utf-8") as f: f.write(patched_code)
             with open(root_app_file, "w", encoding="utf-8") as f: f.write(patched_code)
             await broadcast({"type": "FILE_UPDATE", "file": "app.py", "content": patched_code, "user_id": user_id, "session_id": session_id})
+
+            if not made_progress:
+                state["is_running"] = False
+                await broadcast({"type": "PIPELINE_COMPLETE", "status": "STUCK", "message": "Stopped early: the AI could not generate a working fix for this error. Review the code manually or try a different/stronger model.", "user_id": user_id, "session_id": session_id})
+                return
             continue
 
         await broadcast({"type": "LOG", "agent": "tester", "text": "[Tester Agent] ALL UNIT TESTS PASSED CLEANLY!"})
@@ -1846,32 +2374,15 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
         with open(app_file, "r", encoding="utf-8") as f:
             curr_content = f.read()
 
-        is_vulnerable = ("eval(" in curr_content) or ("f\"SELECT" in curr_content) or ("f'SELECT" in curr_content) or ("f\"./uploads" in curr_content)
+        is_vulnerable = VULN_HEURISTICS[language](curr_content)
 
         # AGENT 3: HACKER AGENT
         await broadcast({"type": "AGENT_START", "agent": "hacker", "title": "Hacker Agent (Red Team Audit)", "user_id": user_id, "session_id": session_id})
-        await broadcast({"type": "LOG", "agent": "hacker", "text": "[Hacker Agent] Running Bandit SAST security analyzer on project workspace..."})
+        await broadcast({"type": "LOG", "agent": "hacker", "text": f"[Hacker Agent] Running {SAST_TOOL_NAME[language]} security analyzer on project workspace..."})
 
-        cmd_bandit = f"{sys.executable} -m bandit -r . -f json -o security_report.json"
-        await run_cmd(cmd_bandit, cwd=session_target_dir)
+        vulnerabilities = await run_sast(language, session_target_dir, app_filename, sec_report_file)
 
-        vulnerabilities = []
-        if os.path.exists(sec_report_file):
-            try:
-                with open(sec_report_file, "r") as f:
-                    data = json.load(f)
-                    results = data.get("results", [])
-                    for item in results:
-                        vulnerabilities.append({
-                            "issue_text": item.get("issue_text"),
-                            "severity": item.get("issue_severity"),
-                            "confidence": item.get("issue_confidence"),
-                            "line": item.get("line_number")
-                        })
-            except Exception:
-                pass
-
-        if (vulnerabilities or is_vulnerable) and current_loop == 1:
+        if vulnerabilities or is_vulnerable:
             await broadcast({"type": "LOG", "agent": "hacker", "text": f"[Hacker Agent] SECURITY VULNERABILITY DETECTED! ({vuln_type})"})
             
             report_text = f"# Security Audit Report (User: {user_id[:8]}...)\n\n"
@@ -1879,7 +2390,7 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
             report_text += f"- **Type**: {vuln_type}\n"
             report_text += f"- **Severity**: HIGH\n"
             report_text += f"- **Details**: {vuln_desc}\n\n"
-            report_text += "### Bandit Analysis Summary:\n"
+            report_text += f"### {SAST_TOOL_NAME[language]} Analysis Summary:\n"
             if vulnerabilities:
                 for v in vulnerabilities:
                     report_text += f"- **[{v['severity']}]** Line {v['line']}: {v['issue_text']}\n"
@@ -1890,7 +2401,7 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
                 f.write(report_text)
 
             await broadcast({"type": "FILE_UPDATE", "file": "vulnerability_report.md", "content": report_text, "user_id": user_id, "session_id": session_id})
-            await broadcast({"type": "TERMINAL_OUTPUT", "cmd": "bandit -r .", "output": f"[SECURITY ALERT] {vuln_type}\nAudit report written to vulnerability_report.md", "user_id": user_id, "session_id": session_id})
+            await broadcast({"type": "TERMINAL_OUTPUT", "cmd": f"{SAST_TOOL_NAME[language]} scan", "output": f"[SECURITY ALERT] {vuln_type}\nAudit report written to vulnerability_report.md", "user_id": user_id, "session_id": session_id})
             await broadcast({"type": "AGENT_END", "agent": "hacker", "status": "VULNERABLE", "user_id": user_id, "session_id": session_id})
 
             # AGENT 4: PATCHER AGENT
@@ -1899,17 +2410,46 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
 
             before_code = curr_content
 
+            if vulnerabilities:
+                findings_text = "\n".join(f"- Line {v['line']}: {v['issue_text']} (severity: {v['severity']})" for v in vulnerabilities)
+            else:
+                findings_text = f"- {vuln_desc}"
+
+            patch_prompt = (
+                f"Fix this {lang_display(language)} code to remove these specific security issues found by {SAST_TOOL_NAME[language]}:\n"
+                f"{findings_text}\n\n"
+                f"Make the MINIMAL change needed to resolve exactly these findings — do not rewrite unrelated code.\n"
+                f"Return ONLY the fixed {lang_display(language)} code, no explanations, no markdown fences:\n\n{before_code}"
+            )
+            patched_res = None
             if ollama_model:
-                patch_prompt = (
-                    f"Fix this Python code to remove the security issue ({vuln_type}).\n"
-                    f"Return ONLY the fixed Python code, no explanations:\n\n{before_code}"
-                )
                 patched_res = await query_ollama(patch_prompt, ollama_model)
-                if patched_res:
-                    p = patched_res.strip()
-                    if "```python" in p: p = p.split("```python")[1].split("```")[0].strip()
-                    elif "```" in p: p = p.split("```")[1].split("```")[0].strip()
-                    patched_code = p
+            elif use_api_key_mode:
+                if is_claude_model:
+                    patched_res, _ = await query_claude_raw(patch_prompt, api_key_to_use)
+                elif is_openrouter_model:
+                    patched_res, _ = await query_openrouter_raw(patch_prompt, api_key_to_use)
+                else:
+                    patched_res, _ = await query_gemini_raw(patch_prompt, api_key_to_use)
+
+            made_progress = False
+            if patched_res:
+                new_code = strip_code_fences(patched_res)
+                if language == "java":
+                    new_code = fix_java_class_visibility(new_code)
+                if new_code.strip() and new_code.strip() != before_code.strip():
+                    patched_code = new_code
+                    made_progress = True
+            elif secure_offline_patch:
+                patched_code = secure_offline_patch
+                made_progress = True
+
+            if not made_progress:
+                await broadcast({"type": "LOG", "agent": "patcher", "text": "[Patcher Agent] No further fix could be generated — stopping early to save API calls."})
+                await broadcast({"type": "AGENT_END", "agent": "patcher", "status": "FAILED", "user_id": user_id, "session_id": session_id})
+                state["is_running"] = False
+                await broadcast({"type": "PIPELINE_COMPLETE", "status": "STUCK", "message": "Stopped early: the AI could not generate a further security fix. Review the code manually or try a different/stronger model.", "user_id": user_id, "session_id": session_id})
+                return
 
             # Chunk stream patched code
             patch_lines = patched_code.split("\n")
@@ -1927,63 +2467,45 @@ async def execute_swarm_workflow(prompt: str, max_loops: int = 10, selected_mode
             await broadcast({"type": "AGENT_END", "agent": "patcher", "status": "PATCHED", "user_id": user_id, "session_id": session_id})
             continue
         else:
-            active_workflow_state["is_running"] = False
+            state["is_running"] = False
             await broadcast({"type": "LOG", "agent": "hacker", "text": "[Hacker Agent] CODEBASE VERIFIED SECURE! Zero vulnerabilities detected."})
             await broadcast({"type": "AGENT_END", "agent": "hacker", "status": "VERIFIED_SECURE", "user_id": user_id, "session_id": session_id})
             await broadcast({"type": "PIPELINE_COMPLETE", "status": "SUCCESS", "message": "App passes all functional tests & static security audits!", "user_id": user_id, "session_id": session_id})
             return
 
-    active_workflow_state["is_running"] = False
-    await broadcast({"type": "PIPELINE_COMPLETE", "status": "MAX_LOOPS_REACHED", "message": f"Reached max loop limit ({active_workflow_state['max_loops']}). Click '+5 Iterations' to extend.", "user_id": user_id, "session_id": session_id})
+    state["is_running"] = False
+    await broadcast({"type": "PIPELINE_COMPLETE", "status": "MAX_LOOPS_REACHED", "message": f"Reached max loop limit ({state['max_loops']}). Click '+5 Iterations' to extend.", "user_id": user_id, "session_id": session_id})
+
+async def _safe_execute_swarm_workflow(prompt, max_loops, selected_model, user_id, session_id, api_key, language="python"):
+    try:
+        await execute_swarm_workflow(prompt, max_loops, selected_model, user_id, session_id, api_key, language)
+    except Exception as e:
+        get_workflow_state(user_id, session_id)["is_running"] = False
+        err_text = f"Unexpected swarm error: {type(e).__name__}: {e}"
+        try:
+            await broadcast({"type": "LOG", "agent": "coder", "text": f"[System] {err_text}"})
+            await broadcast({"type": "STATUS", "message": err_text, "state": "ERROR", "user_id": user_id, "session_id": session_id})
+            await broadcast({"type": "AGENT_END", "agent": "coder", "status": "FAILED", "user_id": user_id, "session_id": session_id})
+            await broadcast({"type": "PIPELINE_COMPLETE", "status": "ERROR", "message": err_text, "user_id": user_id, "session_id": session_id})
+        except Exception:
+            pass
 
 @app.post("/api/swarm/execute")
 async def trigger_swarm(req: PromptRequest):
-    asyncio.create_task(execute_swarm_workflow(req.prompt, req.max_loops, req.selected_model, req.user_id, req.session_id, req.api_key))
-    return {"status": "started", "prompt": req.prompt, "max_loops": req.max_loops, "user_id": req.user_id, "session_id": req.session_id}
+    asyncio.create_task(_safe_execute_swarm_workflow(req.prompt, req.max_loops, req.selected_model, req.user_id, req.session_id, req.api_key, req.language))
+    return {"status": "started", "prompt": req.prompt, "max_loops": req.max_loops, "user_id": req.user_id, "session_id": req.session_id, "language": req.language}
 
 @app.post("/api/swarm/extend")
-async def extend_iterations():
-    global active_workflow_state
-    active_workflow_state["max_loops"] += 5
-    await broadcast({"type": "STATUS", "message": f"Extended max iterations to {active_workflow_state['max_loops']}", "state": "EXTENDED"})
-    await broadcast({"type": "LOOP_START", "loop": active_workflow_state["current_loop"], "max_loops": active_workflow_state["max_loops"]})
-    return {"status": "extended", "new_max_loops": active_workflow_state["max_loops"]}
-
-@app.post("/api/chat")
-async def handle_chat(req: ChatRequest):
-    use_api_key_mode = is_api_key_model(req.selected_model)
-    ollama_model = req.selected_model if req.selected_model and not is_api_key_model(req.selected_model) and req.selected_model not in ["auto", "Auto-Detect / Dynamic Synthesizer"] else None
-
-    system_prompt = (
-        "You are AJENSIKS, an expert DevSecOps AI guide. Your goal is to guide the user, explain code, and answer any doubts they have about the code or the UI.\n"
-        "You have FULL AGENTIC ACCESS to modify the user's codebase.\n"
-        "If the user asks you to modify, fix, or write code, you MUST output the updated code wrapped in exactly this format:\n"
-        "$$APPLY_CODE$$\n<the raw python code>\n$$END_APPLY$$\n"
-        "Do not use markdown blocks inside the APPLY_CODE block. You MUST return the COMPLETE ENTIRE FILE with your modifications included. DO NOT return partial snippets, diffs, or abbreviated code. The frontend will automatically intercept this and overwrite the user's active code editor.\n"
-        "You have access to the user's current workspace code.\n\n"
-        f"--- CURRENT WORKSPACE CODE ---\n{req.context_code}\n------------------------------\n\n"
-        "Keep your answers concise, helpful, and directly address the user's prompt."
-    )
-    
-    full_prompt = f"{system_prompt}\n\nUser: {req.message}"
-    
-    reply = "I'm sorry, I am currently offline. Please configure an AI model."
-    if use_api_key_mode:
-        res, err = await query_gemini_api(full_prompt, PROVIDED_API_KEY)
-        if res: reply = res
-        else: reply = f"Error from Gemini: {err}"
-    elif ollama_model:
-        res = await query_ollama(full_prompt, ollama_model)
-        if res: reply = res
-        else: reply = "Error from local Ollama model."
-    else:
-        reply = "I am AJENSIKS! Please select a valid AI model in the top right dropdown so I can help you."
-
-    return {"status": "success", "reply": reply}
+async def extend_iterations(req: ExtendRequest):
+    state = get_workflow_state(req.user_id, req.session_id)
+    state["max_loops"] += 5
+    await broadcast({"type": "STATUS", "message": f"Extended max iterations to {state['max_loops']}", "state": "EXTENDED", "user_id": req.user_id, "session_id": req.session_id})
+    await broadcast({"type": "LOOP_START", "loop": state["current_loop"], "max_loops": state["max_loops"], "user_id": req.user_id, "session_id": req.session_id})
+    return {"status": "extended", "new_max_loops": state["max_loops"]}
 
 @app.post("/api/save-code")
 async def save_code(req: CustomCodeRequest):
-    user_dir = os.path.join(workspaces_dir, req.user_id)
+    user_dir = secure_join(workspaces_dir, req.user_id)
     os.makedirs(user_dir, exist_ok=True)
     
     session_target_dir = user_dir
@@ -1999,9 +2521,9 @@ async def save_code(req: CustomCodeRequest):
 
 @app.post("/api/swarm/audit-custom-code")
 async def audit_custom_code(req: CustomCodeRequest):
-    user_dir = os.path.join(workspaces_dir, req.user_id)
+    user_dir = secure_join(workspaces_dir, req.user_id)
     os.makedirs(user_dir, exist_ok=True)
-    
+
     session_target_dir = user_dir
     if req.session_id:
         session_target_dir = os.path.join(user_dir, "sessions", req.session_id)
@@ -2009,36 +2531,48 @@ async def audit_custom_code(req: CustomCodeRequest):
 
     app_file = os.path.join(session_target_dir, req.filename)
     root_app_file = os.path.join(user_dir, req.filename)
-    
+
     with open(app_file, "w", encoding="utf-8") as f: f.write(req.code)
     with open(root_app_file, "w", encoding="utf-8") as f: f.write(req.code)
 
+    detected_ext = os.path.splitext(req.filename)[1].lstrip(".")
+    detected_language = next((lang for lang, cfg in LANGUAGE_CONFIG.items() if cfg["ext"] == detected_ext), "python")
+
     await broadcast({"type": "STATUS", "message": "Auditing User Custom Code Edits...", "state": "RUNNING", "user_id": req.user_id, "session_id": req.session_id})
     await broadcast({"type": "FILE_UPDATE", "file": "app.py", "content": req.code, "user_id": req.user_id, "session_id": req.session_id})
-    
-    asyncio.create_task(execute_swarm_workflow(prompt="User Custom Code Edit Audit", max_loops=5, user_id=req.user_id, session_id=req.session_id))
+
+    asyncio.create_task(_safe_execute_swarm_workflow(prompt="User Custom Code Edit Audit", max_loops=5, selected_model=None, user_id=req.user_id, session_id=req.session_id, api_key=None, language=detected_language))
     return {"status": "started", "message": "Auditing custom user code edits"}
 
 @app.post("/api/swarm/run-code")
 async def run_code(req: RunCodeRequest):
-    asyncio.create_task(execute_run_and_debug(req.code, req.user_id, req.session_id, req.selected_model, req.max_attempts))
+    asyncio.create_task(execute_run_and_debug(req.code, req.user_id, req.session_id, req.selected_model, req.max_attempts, req.language))
     return {"status": "started", "message": "Running code locally"}
 
 @app.post("/api/run/start")
 async def start_interactive(req: RunInteractiveRequest):
-    user_dir = os.path.join(workspaces_dir, req.user_id)
+    user_dir = secure_join(workspaces_dir, req.user_id)
     os.makedirs(user_dir, exist_ok=True)
     session_target_dir = user_dir
     if req.session_id:
         session_target_dir = os.path.join(user_dir, "sessions", req.session_id)
         os.makedirs(session_target_dir, exist_ok=True)
 
-    app_file = os.path.join(session_target_dir, "generated_app.py")
-    with open(app_file, "w", encoding="utf-8") as f: f.write(req.code)
-    with open(os.path.join(user_dir, "generated_app.py"), "w", encoding="utf-8") as f: f.write(req.code)
+    language = req.language if req.language in LANGUAGE_CONFIG else "python"
+    code_to_run = fix_java_class_visibility(req.code) if language == "java" else req.code
+    app_filename = f"generated_app.{lang_ext(language)}"
+    app_file = os.path.join(session_target_dir, app_filename)
+    with open(app_file, "w", encoding="utf-8") as f: f.write(code_to_run)
+    with open(os.path.join(user_dir, app_filename), "w", encoding="utf-8") as f: f.write(code_to_run)
+
+    ok, argv, compile_err = await compile_for_run(language, session_target_dir, app_filename)
+    if not ok:
+        await broadcast({"type": "INTERACTIVE_OUTPUT", "text": compile_err, "process_id": req.process_id, "user_id": req.user_id, "session_id": req.session_id})
+        await broadcast({"type": "PROCESS_DONE", "exit_code": 1, "process_id": req.process_id, "user_id": req.user_id, "session_id": req.session_id})
+        return {"status": "error", "message": "Compile failed", "process_id": req.process_id}
 
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", app_file,
+        *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -2070,7 +2604,7 @@ async def kill_process(req: SendInputRequest):
 
 @app.get("/api/swarm/export/{user_id}")
 async def export_package(user_id: str):
-    user_dir = os.path.join(workspaces_dir, user_id)
+    user_dir = secure_join(workspaces_dir, user_id)
     zip_buffer = io.BytesIO()
 
     files_to_zip = ["generated_app.py", "test_generated_app.py", "vulnerability_report.md", "security_report.json"]
@@ -2090,7 +2624,7 @@ async def export_package(user_id: str):
 
 @app.get("/api/workspace-files")
 async def get_workspace_files(user_id: str, session_id: str):
-    target_dir = os.path.join(workspaces_dir, user_id, "sessions", session_id)
+    target_dir = secure_join(workspaces_dir, user_id, "sessions", session_id)
     if not os.path.exists(target_dir):
         return {"files": []}
     
@@ -2098,52 +2632,56 @@ async def get_workspace_files(user_id: str, session_id: str):
     for root, dirs, filenames in os.walk(target_dir):
         dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']
         for f in filenames:
-            if f.startswith('.') or f.endswith(".pyc") or f == ".DS_Store" or f.endswith(".json"): continue
+            if f.startswith('.') or f.endswith(".pyc") or f == ".DS_Store" or f.endswith(".json") or f.endswith(".o") or f.endswith(".exe") or f.endswith(".class"): continue
             rel_path = os.path.relpath(os.path.join(root, f), target_dir)
             files.append(rel_path.replace("\\", "/"))
     return {"files": sorted(files)}
 
 @app.get("/api/file-content")
 async def get_file_content(user_id: str, session_id: str, filename: str):
-    target_file = os.path.join(workspaces_dir, user_id, "sessions", session_id, filename)
+    target_file = secure_join(workspaces_dir, user_id, "sessions", session_id, filename)
     if not os.path.exists(target_file):
         raise HTTPException(status_code=404, detail="File not found")
-    with open(target_file, "r", encoding="utf-8") as f:
-        content = f.read()
+    try:
+        with open(target_file, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        content = "[Binary file cannot be displayed in text editor]"
     return {"content": content}
 
 
-def parse_multifile_response(resp_text: str, target_dir: str) -> str:
+def parse_multifile_response(resp_text: str, target_dir: str, main_filename: str = "generated_app.py") -> str:
     # Extracts $$FILE: name$$ and writes them. Returns main code for fallback testing.
     import re
     pattern = re.compile(r"\$\$FILE:\s*(.+?)\$\$(.*?)(?=\$\$FILE:|\Z)", re.DOTALL)
     matches = pattern.findall(resp_text)
-    
+
     if not matches:
         # Fallback if AI ignored format
-        app_file = os.path.join(target_dir, "generated_app.py")
+        app_file = os.path.join(target_dir, main_filename)
         with open(app_file, "w", encoding="utf-8") as f:
             f.write(resp_text.strip())
         return resp_text.strip()
-        
+
     main_code = ""
     for filename, content in matches:
         filename = filename.strip()
         content = content.strip()
-        if filename.endswith(".py"):
-            # Strip markdown if present
-            if content.startswith("```python"): content = content[9:]
-            if content.startswith("```"): content = content[3:]
-            if content.endswith("```"): content = content[:-3]
-            content = content.strip()
-            
-        if filename == "generated_app.py" or not main_code:
+        # Strip markdown fences regardless of language/extension. Models sometimes wrap the
+        # WHOLE multi-file response in one big fence (rather than per-file), which leaves a
+        # stray ``` marker line stuck in the middle of a file's content — a guaranteed compile
+        # error since ``` is never valid source. Strip any such line, not just leading/trailing.
+        content = re.sub(r"^```[a-zA-Z0-9+]*\n?", "", content)
+        content = re.sub(r"\n?```$", "", content)
+        content = re.sub(r"(?m)^```[a-zA-Z0-9+]*\s*$\n?", "", content).strip()
+
+        if filename == main_filename or not main_code:
             main_code = content
-            
+
         file_path = os.path.join(target_dir, filename)
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(content)
-            
+
     return main_code
 

@@ -10,6 +10,9 @@ let isEditMode = false;
 let currentSessionId = null;
 let sessionsList = [];
 let currentProcessId = null;
+let swarmWatchdogTimer = null;
+let currentLanguage = "python";
+const SAFETY_MAX_LOOPS = 30;
 
 function initSupabase() {
   if (window.supabase) {
@@ -168,6 +171,10 @@ function initWebSocket() {
     console.log("WebSocket connected to DevSecOps Swarm.");
     const st = document.getElementById("status-text");
     if (st) st.innerText = "System Ready";
+    if (window.__wasDisconnected) {
+      appendTerminal(`\n[System] Reconnected to server.`, "system");
+      window.__wasDisconnected = false;
+    }
   };
 
   ws.onmessage = (event) => {
@@ -180,6 +187,12 @@ function initWebSocket() {
   };
 
   ws.onclose = () => {
+    const st = document.getElementById("status-text");
+    if (st) st.innerText = "⚠ Disconnected — reconnecting...";
+    if (!window.__wasDisconnected) {
+      appendTerminal(`\n[System] Lost connection to server. Retrying every 3s — if this persists, the backend may have stopped; restart it and refresh this page.`, "system");
+      window.__wasDisconnected = true;
+    }
     setTimeout(initWebSocket, 3000);
   };
 }
@@ -331,6 +344,7 @@ function loadSession(sessionId) {
       if (runOut) runOut.innerHTML = '<div class="terminal-line system" style="color: #64748b; font-style: italic;">[Interactive run ready. Click "▶ Interactive Run" to execute code.]</div>';
 
       appendTerminal(`[Session] Switched active workspace to session: ${sessionId}`, "system");
+      loadWorkspaceFiles();
     })
     .catch(err => console.error("Error loading session details:", err));
 }
@@ -433,12 +447,19 @@ function startSwarm() {
 
   const promptInput = document.getElementById("prompt-input");
   const prompt = promptInput ? promptInput.value.trim() : "";
-  const maxLoops = parseInt(document.getElementById("max-loops-select").value) || 10;
+  // No manual loop picker — the agents keep going until the code is secure and passing,
+  // or the built-in "no progress" safety net gives up. SAFETY_MAX_LOOPS is just a hard
+  // ceiling to prevent a truly runaway loop, not something users tune.
+  const maxLoops = SAFETY_MAX_LOOPS;
   const selectedModel = document.getElementById("model-select").value;
+  const langSelect = document.getElementById("language-select");
+  const selectedLanguage = langSelect ? langSelect.value : "python";
   if (!prompt) {
     alert("Please enter a software prompt to execute!");
     return;
   }
+
+  currentLanguage = selectedLanguage;
 
   isRunning = true;
   const runBtn = document.getElementById("run-btn");
@@ -456,6 +477,7 @@ function startSwarm() {
       prompt: prompt,
       max_loops: maxLoops,
       selected_model: selectedModel,
+      language: selectedLanguage,
       user_id: currentUser.id,
       session_id: currentSessionId
     })
@@ -471,6 +493,19 @@ function startSwarm() {
       runBtn.innerText = "Execute Swarm Loop";
     }
   });
+
+  clearTimeout(swarmWatchdogTimer);
+  swarmWatchdogTimer = setTimeout(() => {
+    if (!isRunning) return;
+    appendTerminal(`\n[Watchdog] No response from server after 260s (connection lost or server error). Resetting — please try again.`, "cmd");
+    isRunning = false;
+    const btn = document.getElementById("run-btn");
+    if (btn) {
+      btn.disabled = false;
+      btn.innerText = "Execute Swarm Loop";
+    }
+    ["coder", "tester", "hacker", "patcher"].forEach(a => setAgentState(a, "", "IDLE"));
+  }, 260000);
 }
 
 function toggleEditMode() {
@@ -531,7 +566,14 @@ function auditCustomCode() {
 }
 
 function extendIterations() {
-  fetch("/api/swarm/extend", { method: "POST" })
+  fetch("/api/swarm/extend", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      user_id: currentUser ? currentUser.id : "default_user",
+      session_id: currentSessionId
+    })
+  })
     .then(res => res.json())
     .then(data => {
       document.getElementById("max-loop-display").innerText = data.new_max_loops;
@@ -676,6 +718,21 @@ function highlightAllCodeBlocks() {
 }
 
 function handleSwarmEvent(data) {
+  if (isRunning && data.type !== "PIPELINE_COMPLETE") {
+    clearTimeout(swarmWatchdogTimer);
+    swarmWatchdogTimer = setTimeout(() => {
+      if (!isRunning) return;
+      appendTerminal(`\n[Watchdog] No response from server after 260s (connection lost or server error). Resetting — please try again.`, "cmd");
+      isRunning = false;
+      const btn = document.getElementById("run-btn");
+      if (btn) {
+        btn.disabled = false;
+        btn.innerText = "Execute Swarm Loop";
+      }
+      ["coder", "tester", "hacker", "patcher"].forEach(a => setAgentState(a, "", "IDLE"));
+    }, 260000);
+  }
+
   switch (data.type) {
     case "STATUS":
       const statusEl = document.getElementById("status-text");
@@ -685,7 +742,7 @@ function handleSwarmEvent(data) {
     case "LOOP_START":
       document.getElementById("loop-counter").innerText = data.loop;
       document.getElementById("max-loop-display").innerText = data.max_loops;
-      ["coder", "tester", "hacker", "patcher"].forEach(a => setAgentState(a, "", "IDLE"));
+      ["tester", "hacker", "patcher"].forEach(a => setAgentState(a, "", "IDLE"));
       break;
 
     case "AGENT_START":
@@ -699,12 +756,17 @@ function handleSwarmEvent(data) {
       break;
 
     case "AGENT_END":
+      if (data.agent === "coder" && (data.status === "SUCCESS" || data.status === "FAILED")) {
+        loadWorkspaceFiles();
+      }
       if (data.status === "SUCCESS") {
         setAgentState(data.agent, "success", "PASSED");
       } else if (data.status === "VULNERABLE") {
         setAgentState(data.agent, "vulnerable", "VULNERABLE");
       } else if (data.status === "PATCHED") {
         setAgentState(data.agent, "success", "PATCHED");
+      } else if (data.status === "VERIFIED_SECURE") {
+        setAgentState(data.agent, "success", "SECURE");
       } else {
         setAgentState(data.agent, "", "FAILED");
       }
@@ -779,15 +841,16 @@ function handleSwarmEvent(data) {
       break;
 
     case "RUN_COMPLETE":
-      const runCodeBtnEl = document.getElementById("run-code-btn");
-      if (runCodeBtnEl) {
-        runCodeBtnEl.disabled = false;
-        runCodeBtnEl.innerText = "▶ Run & Auto-Debug";
+      const recheckBtnEl = document.getElementById("recheck-btn");
+      if (recheckBtnEl) {
+        recheckBtnEl.disabled = false;
+        recheckBtnEl.innerText = "🔁 Recheck with AI";
       }
       appendTerminal(`\n[Run Complete] Status: ${data.status} after ${data.attempts} attempt(s).`, "cmd");
       break;
 
     case "PIPELINE_COMPLETE":
+      clearTimeout(swarmWatchdogTimer);
       isRunning = false;
       document.getElementById("run-btn").disabled = false;
       document.getElementById("run-btn").innerText = "Execute Swarm Loop";
@@ -795,6 +858,7 @@ function handleSwarmEvent(data) {
       if (statusComp) statusComp.innerText = "Verified Secure";
       appendTerminal(`\n[Pipeline Complete] ${cleanText(data.message)}`, "cmd");
       loadUserSessions();
+      loadWorkspaceFiles();
       break;
   }
 }
@@ -863,6 +927,10 @@ function setRunStatus(state) {
   }
 }
 
+function getActiveLanguage() {
+  return (typeof currentLanguage !== 'undefined' && currentLanguage) ? currentLanguage : "python";
+}
+
 function runInteractive() {
   if (!currentUser) continueAsGuest();
   const code = getActiveCode();
@@ -887,7 +955,8 @@ function runInteractive() {
       code: code,
       process_id: currentProcessId,
       user_id: currentUser.id,
-      session_id: currentSessionId
+      session_id: currentSessionId,
+      language: getActiveLanguage()
     })
   }).catch(err => {
     appendRunOutput("[Error] Failed to start process: " + err, "run-line-fail");
@@ -907,17 +976,38 @@ function sendRunInput() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ process_id: currentProcessId, text: text, user_id: currentUser ? currentUser.id : "guest" })
-  }).catch(err => console.error("stdin send error:", err));
+  })
+  .then(res => {
+    if (!res.ok) appendRunOutput("[Warning] Server couldn't deliver that input — the process may have already ended.", "run-line-fail");
+    return res.json();
+  })
+  .then(data => {
+    if (data && data.status === "error") {
+      appendRunOutput(`[Warning] ${data.message || "No active process to send input to."}`, "run-line-fail");
+    }
+  })
+  .catch(() => {
+    appendRunOutput("[Error] Could not reach the server — the backend may be down. Restart it and refresh this page.", "run-line-fail");
+  });
 }
 
-function killRunProcess() {
+async function killRunProcess() {
   if (!currentProcessId) return;
-  fetch("/api/run/kill", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ process_id: currentProcessId, text: "", user_id: currentUser ? currentUser.id : "guest" })
-  }).catch(() => {});
-  appendRunOutput("[Process killed by user]", "run-line-fail");
+  const killedId = currentProcessId;
+  try {
+    const res = await fetch("/api/run/kill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ process_id: killedId, text: "", user_id: currentUser ? currentUser.id : "guest" })
+    });
+    if (res.ok) {
+      appendRunOutput("[Process killed by user]", "run-line-fail");
+    } else {
+      appendRunOutput(`[Warning] Server responded with an error (status ${res.status}) — the process may still be running. Try again or restart the backend.`, "run-line-fail");
+    }
+  } catch (err) {
+    appendRunOutput("[Error] Could not reach the server to kill this process — the backend may be down. Restart it and refresh this page.", "run-line-fail");
+  }
   setRunStatus("idle");
   currentProcessId = null;
   const btn = document.getElementById("run-code-btn");
@@ -937,14 +1027,14 @@ function runActiveCode() {
   const code = getActiveCode();
   if (!code.trim()) return;
 
-  const runCodeBtn = document.getElementById("run-code-btn");
-  if (runCodeBtn) {
-    runCodeBtn.disabled = true;
-    runCodeBtn.innerText = "Running...";
+  const recheckBtn = document.getElementById("recheck-btn");
+  if (recheckBtn) {
+    recheckBtn.disabled = true;
+    recheckBtn.innerText = "Rechecking...";
   }
 
   switchTabByName("terminal");
-  appendTerminal(`\n[System] Running code locally...`, "cmd");
+  appendTerminal(`\n[System] Asking AI to run and auto-fix the current code...`, "cmd");
 
   const modelSelect = document.getElementById("model-select");
 
@@ -955,13 +1045,14 @@ function runActiveCode() {
       code: code,
       user_id: currentUser.id,
       session_id: currentSessionId,
-      selected_model: modelSelect ? modelSelect.value : null
+      selected_model: modelSelect ? modelSelect.value : null,
+      language: getActiveLanguage()
     })
   }).catch(err => {
     console.error("Error running code:", err);
-    if (runCodeBtn) {
-      runCodeBtn.disabled = false;
-      runCodeBtn.innerText = "▶ Run & Auto-Debug";
+    if (recheckBtn) {
+      recheckBtn.disabled = false;
+      recheckBtn.innerText = "🔁 Recheck with AI";
     }
   });
 }
@@ -1050,108 +1141,6 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 
-// --- AJENSIKS Chat Logic ---
-function toggleAjensiks() {
-  const widget = document.getElementById("ajensiks-widget");
-  const body = document.getElementById("ajensiks-body");
-  const icon = document.getElementById("ajensiks-toggle-icon");
-  if (widget.classList.contains("open")) {
-    widget.classList.remove("open");
-    body.style.display = "none";
-    icon.innerHTML = "&#128172;";
-  } else {
-    widget.classList.add("open");
-    body.style.display = "flex";
-    icon.innerHTML = "&#9660;";
-    document.getElementById("ajensiks-input").focus();
-  }
-}
-
-async function sendAjensiksMessage() {
-  const inputEl = document.getElementById("ajensiks-input");
-  const msg = inputEl.value.trim();
-  if (!msg) return;
-  
-  inputEl.value = "";
-  inputEl.disabled = true;
-  
-  const msgsDiv = document.getElementById("ajensiks-messages");
-  msgsDiv.innerHTML += `<div class="chat-msg user-msg">${escapeHtml(msg)}</div>`;
-  msgsDiv.scrollTop = msgsDiv.scrollHeight;
-  
-  const code = getActiveCode() || "";
-  const modelSelect = document.getElementById("model-select");
-  
-  // Show typing indicator
-  const typingId = "typing-" + Date.now();
-  msgsDiv.innerHTML += `<div class="chat-msg ai-msg" id="${typingId}">Thinking...</div>`;
-  msgsDiv.scrollTop = msgsDiv.scrollHeight;
-  
-  try {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: msg,
-        user_id: currentUser ? currentUser.id : "default",
-        session_id: currentSessionId || "default",
-        context_code: code,
-        selected_model: modelSelect ? modelSelect.value : null
-      })
-    });
-    
-    document.getElementById(typingId).remove();
-    
-    if (!res.ok) throw new Error("API Error");
-    const data = await res.json();
-    
-    let replyText = data.reply;
-    let codeToApply = null;
-    const applyRegex = /\$\$APPLY_CODE\$\$\n?([\s\S]*?)\n?\$\$END_APPLY\$\$/;
-    const match = replyText.match(applyRegex);
-    if (match) {
-      codeToApply = match[1];
-      if (codeToApply.startsWith("```python")) codeToApply = codeToApply.replace(/^```python\n?/, "");
-      else if (codeToApply.startsWith("```")) codeToApply = codeToApply.replace(/^```\n?/, "");
-      if (codeToApply.endsWith("```")) codeToApply = codeToApply.replace(/\n?```$/, "");
-      replyText = replyText.replace(applyRegex, "").trim();
-      if (!replyText) replyText = "I have successfully updated your code in the editor!";
-    }
-    
-    msgsDiv.innerHTML += `<div class="chat-msg ai-msg">${escapeHtml(replyText)}</div>`;
-    saveAjensiksHistory();
-    
-    if (codeToApply) {
-      const editor = document.getElementById("code-editor");
-      if (editor.style.display === "none") toggleEditMode();
-      editor.value = codeToApply;
-      saveCodeLocally();
-      setTimeout(refreshFileExplorer, 500); // refresh explorer just in case
-    }
-  } catch (err) {
-    if(document.getElementById(typingId)) document.getElementById(typingId).remove();
-    msgsDiv.innerHTML += `<div class="chat-msg ai-msg" style="color: #f87171;">Connection error. Please check server.</div>`;
-  }
-  
-  inputEl.disabled = false;
-  inputEl.focus();
-  msgsDiv.scrollTop = msgsDiv.scrollHeight;
-}
-
-document.addEventListener("DOMContentLoaded", () => {
-  const ajInput = document.getElementById("ajensiks-input");
-  if (ajInput) {
-    ajInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        sendAjensiksMessage();
-      }
-    });
-  }
-});
-
-
-
 // --- ADVANCED FEATURES ---
 
 // 1. Save Code Locally
@@ -1224,46 +1213,6 @@ function downloadAuditReport() {
   URL.revokeObjectURL(url);
 }
 
-// 3. Persist AJENSIKS Chat History
-const ajensiksStorageKey = () => `ajensiks_history_${currentSessionId || "default"}`;
-
-function saveAjensiksHistory() {
-  const msgsDiv = document.getElementById("ajensiks-messages");
-  if (msgsDiv) {
-    localStorage.setItem(ajensiksStorageKey(), msgsDiv.innerHTML);
-  }
-}
-
-function loadAjensiksHistory() {
-  const msgsDiv = document.getElementById("ajensiks-messages");
-  if (msgsDiv) {
-    const history = localStorage.getItem(ajensiksStorageKey());
-    if (history) {
-      msgsDiv.innerHTML = history;
-    } else {
-      msgsDiv.innerHTML = `<div class="chat-msg ai-msg">
-        Hello! I am AJENSIKS, your DevSecOps AI guide. I&#39;m tracking your workspace. How can I help?
-      </div>`;
-    }
-    msgsDiv.scrollTop = msgsDiv.scrollHeight;
-  }
-}
-
-// Override original loadSession to also load history
-const originalLoadSession = loadSession;
-loadSession = function(sessionId) {
-  originalLoadSession(sessionId);
-  setTimeout(loadAjensiksHistory, 500); // Wait a bit for session switch to complete
-};
-
-// Also hook into sendAjensiksMessage to save history after receiving replies
-const originalSendAjensiksMessage = sendAjensiksMessage;
-sendAjensiksMessage = async function() {
-  await originalSendAjensiksMessage();
-  saveAjensiksHistory();
-};
-
-
 // --- MULTI-FILE EXPLORER LOGIC ---
 let activeFilename = "generated_app.py";
 
@@ -1273,7 +1222,13 @@ async function loadWorkspaceFiles() {
     const res = await fetch(`/api/workspace-files?user_id=${currentUser.id}&session_id=${currentSessionId}`);
     if (!res.ok) return;
     const data = await res.json();
-    renderFileTree(data.files || []);
+    const files = data.files || [];
+    renderFileTree(files);
+    // Keep currentLanguage in sync with whichever generated_app.* file actually exists,
+    // rather than trusting UI state that may be stale from a previous session/run.
+    if (files.includes("generated_app.cpp")) currentLanguage = "cpp";
+    else if (files.includes("generated_app.java")) currentLanguage = "java";
+    else if (files.includes("generated_app.py")) currentLanguage = "python";
   } catch (err) {
     console.error("Failed to load workspace files:", err);
   }
@@ -1291,8 +1246,10 @@ function renderFileTree(files) {
   
   files.forEach(file => {
     const isPython = file.endsWith(".py");
+    const isCpp = file.endsWith(".cpp") || file.endsWith(".hpp") || file.endsWith(".h");
+    const isJava = file.endsWith(".java");
     const isJson = file.endsWith(".json");
-    const icon = isPython ? "&#128013;" : (isJson ? "&#128203;" : "&#128196;");
+    const icon = isPython ? "&#128013;" : isCpp ? "&#9881;&#65039;" : isJava ? "&#9749;" : (isJson ? "&#128203;" : "&#128196;");
     
     const div = document.createElement("div");
     div.className = `file-node ${file === activeFilename ? "active-file" : ""}`;
@@ -1304,7 +1261,12 @@ function renderFileTree(files) {
 
 async function loadFile(filename) {
   activeFilename = filename;
-  
+  if (filename.startsWith("generated_app.")) {
+    if (filename.endsWith(".cpp")) currentLanguage = "cpp";
+    else if (filename.endsWith(".java")) currentLanguage = "java";
+    else if (filename.endsWith(".py")) currentLanguage = "python";
+  }
+
   // Re-render tree to update active highlight
   loadWorkspaceFiles();
   
@@ -1320,7 +1282,8 @@ async function loadFile(filename) {
     // Set Editor Content
     const pre = document.getElementById("code-display");
     if (pre) {
-      pre.innerHTML = `<code class="language-python">${escapeHtml(data.content)}</code>`;
+      const hljsLang = filename.endsWith(".cpp") ? "cpp" : filename.endsWith(".java") ? "java" : "python";
+      pre.innerHTML = `<code class="language-${hljsLang}">${escapeHtml(data.content)}</code>`;
       hljs.highlightElement(pre.querySelector("code"));
     }
     

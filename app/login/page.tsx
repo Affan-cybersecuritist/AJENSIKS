@@ -1,9 +1,11 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { supabase } from '../../lib/supabaseClient';
 
 export default function LoginPage() {
+  const router = useRouter();
   const [isSignUp, setIsSignUp] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -17,7 +19,7 @@ export default function LoginPage() {
     const checkSession = async () => {
       const { data: { session } } = await supabase.auth.getSession();
       if (session) {
-        window.location.href = '/dashboard';
+        router.push('/dashboard');
       }
     };
     checkSession();
@@ -25,14 +27,14 @@ export default function LoginPage() {
     // Subscribe to auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (session && event === 'SIGNED_IN') {
-        window.location.href = '/dashboard';
+        router.push('/dashboard');
       }
     });
 
     return () => {
       subscription.unsubscribe();
     };
-  }, []);
+  }, [router]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -56,7 +58,7 @@ export default function LoginPage() {
         if (error) throw error;
 
         if (data.session) {
-          window.location.href = '/dashboard';
+          router.push('/dashboard');
         } else {
           setSuccessMsg('Account created successfully! Check your email to confirm registration or sign in.');
         }
@@ -70,7 +72,7 @@ export default function LoginPage() {
         if (error) throw error;
 
         if (data.session) {
-          window.location.href = '/dashboard';
+          router.push('/dashboard');
         }
       }
     } catch (err: any) {

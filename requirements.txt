@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+reportlab
+bandit
+pytest
+requests
+python-dotenv

@@ -19,11 +19,4 @@ def authenticate_user(conn, username, password):
 
 if __name__ == "__main__":
     conn = init_db()
-    print("=== System Login ===")
-    username = input("Enter username: ")
-    password = input("Enter password: ")
-    result = authenticate_user(conn, username, password)
-    if result:
-        print(f"Success! Welcome, {username}.")
-    else:
-        print("Login failed: Invalid credentials.")
+    print("Admin Auth:", authenticate_user(conn, "admin", "secret123"))
