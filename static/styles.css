@@ -355,13 +355,16 @@ body {
   left: 100%;
 }
 
-/* Executive Static Cards (3D Tilt Completely Removed) */
-.card-3d, .card-static-pop {
+/* Executive Static Cards (3D Tilt Completely Removed)
+   The :not(.is-signing-in) guard matters: an !important declaration outranks a CSS animation,
+   so while the auth card (which also carries .card-3d) is playing its sign-in flip, this rule
+   would otherwise pin transform to none and the animation would run with no visible movement. */
+.card-3d:not(.is-signing-in), .card-static-pop:not(.is-signing-in) {
   transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
   transform: none !important;
 }
 
-.card-3d:hover, .card-static-pop:hover {
+.card-3d:hover:not(.is-signing-in), .card-static-pop:hover:not(.is-signing-in) {
   transform: translateY(-3px) !important;
   box-shadow: 0 12px 36px rgba(128, 15, 47, 0.12) !important;
   border-color: rgba(217, 4, 41, 0.3) !important;
@@ -1580,3 +1583,125 @@ body {
 }
 
 
+
+/* ── Sign-in gate ───────────────────────────────────────────────────────────
+   The workspace is hidden until a real Supabase session is confirmed. The auth
+   overlay alone was not enough: it is only 75% opaque with a backdrop blur, so
+   the entire workspace (sidebar, sessions, generated code) stayed legible behind
+   it — and it rendered on first paint before the session check had even run.
+   `is-authenticated` is set on <body> only by onUserAuthenticated().            */
+#app-content { display: none; }
+body.is-authenticated #app-content { display: block; }
+
+/* With nothing behind it to reveal, the overlay can be fully opaque. */
+body:not(.is-authenticated) .auth-modal-overlay {
+  background: #120c0e;
+  backdrop-filter: none;
+}
+
+/* ── Sign-in success transition ─────────────────────────────────────────────
+   A 3D hand-off from the auth card into the workspace: the card flips away in
+   perspective while a success seal pulses, then the workspace rises into place.
+   Purely presentational — every step is driven by classes toggled in app.js and
+   the workspace is still gated on `is-authenticated`.                          */
+
+/* Perspective must live on the ancestor for children to rotate in real 3D. */
+.auth-modal-overlay { perspective: 1400px; transform-style: preserve-3d; }
+
+/* 1. the auth card flips back and away */
+.auth-card.is-signing-in {
+  animation: authCardFlyaway .9s cubic-bezier(.6,.02,.35,1) forwards;
+  transform-origin: 50% 55%;
+  pointer-events: none;
+}
+@keyframes authCardFlyaway {
+  0%   { transform: perspective(1400px) rotateX(0deg) translateZ(0) scale(1);      opacity: 1; }
+  35%  { transform: perspective(1400px) rotateX(-8deg) translateZ(60px) scale(1.03); opacity: 1; }
+  100% { transform: perspective(1400px) rotateX(28deg) translateZ(-420px) translateY(-40px) scale(.86); opacity: 0; }
+}
+
+/* 2. the overlay dissolves behind it */
+.auth-modal-overlay.is-dissolving {
+  animation: authOverlayOut .95s ease forwards;
+  animation-delay: .25s;
+  pointer-events: none;
+}
+@keyframes authOverlayOut { to { opacity: 0; visibility: hidden; } }
+
+/* 3. success seal — a shield that stamps in, ripples, then recedes */
+.signin-seal {
+  position: fixed; inset: 0; z-index: 1600;
+  display: grid; place-items: center;
+  pointer-events: none;
+  perspective: 1000px;
+}
+.signin-seal-badge {
+  position: relative;
+  width: 116px; height: 116px;
+  display: grid; place-items: center;
+  border-radius: 32px;
+  background: linear-gradient(150deg, #ffffff, #fff0f3);
+  border: 1px solid rgba(128,15,47,.16);
+  box-shadow: 0 26px 70px -18px rgba(217,4,41,.62), inset 0 1px 0 rgba(255,255,255,.95);
+  animation: sealStamp 1.15s cubic-bezier(.2,.9,.3,1.1) forwards;
+}
+@keyframes sealStamp {
+  0%   { transform: rotateX(-55deg) scale(.4); opacity: 0; }
+  45%  { transform: rotateX(0deg) scale(1.08); opacity: 1; }
+  62%  { transform: rotateX(0deg) scale(.98); opacity: 1; }
+  100% { transform: rotateX(0deg) scale(1) translateZ(120px); opacity: 0; }
+}
+.signin-seal-badge svg { width: 54px; height: 54px; color: #d90429; overflow: visible; }
+.signin-seal-badge .seal-check {
+  stroke: #15803d; stroke-width: 2.6; stroke-dasharray: 26; stroke-dashoffset: 26;
+  animation: sealDraw .5s cubic-bezier(.65,0,.35,1) .34s forwards;
+}
+@keyframes sealDraw { to { stroke-dashoffset: 0; } }
+
+/* expanding rings radiating from the seal */
+.signin-seal-ring {
+  position: absolute; inset: 0; border-radius: 34px;
+  border: 2px solid rgba(217,4,41,.5);
+  animation: sealRipple 1s ease-out forwards; animation-delay: .38s;
+}
+.signin-seal-ring:nth-of-type(2) { animation-delay: .54s; border-color: rgba(128,15,47,.4); }
+@keyframes sealRipple {
+  0%   { transform: scale(1);   opacity: .85; }
+  100% { transform: scale(2.5); opacity: 0; }
+}
+
+/* 4. the workspace rises in behind it */
+#app-content.is-entering { animation: workspaceRise 1s cubic-bezier(.22,.85,.3,1) forwards; transform-origin: 50% 100%; }
+@keyframes workspaceRise {
+  0%   { opacity: 0; transform: perspective(1500px) rotateX(9deg) translateY(46px) scale(.955); filter: blur(7px); }
+  55%  { opacity: 1; }
+  100% { opacity: 1; transform: perspective(1500px) rotateX(0deg) translateY(0) scale(1); filter: blur(0); }
+}
+
+/* stagger the main panels in so it reads as assembling, not just fading */
+#app-content.is-entering .agent-node,
+#app-content.is-entering .stat-card-mini,
+#app-content.is-entering .glass-panel {
+  animation: panelIn .55s cubic-bezier(.22,.85,.3,1) backwards;
+}
+#app-content.is-entering .stat-card-mini:nth-child(1) { animation-delay: .30s; }
+#app-content.is-entering .stat-card-mini:nth-child(2) { animation-delay: .36s; }
+#app-content.is-entering .stat-card-mini:nth-child(3) { animation-delay: .42s; }
+#app-content.is-entering .agent-node:nth-child(1) { animation-delay: .46s; }
+#app-content.is-entering .agent-node:nth-child(3) { animation-delay: .53s; }
+#app-content.is-entering .agent-node:nth-child(5) { animation-delay: .60s; }
+#app-content.is-entering .agent-node:nth-child(7) { animation-delay: .67s; }
+@keyframes panelIn {
+  from { opacity: 0; transform: translateY(18px) scale(.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-card.is-signing-in,
+  .auth-modal-overlay.is-dissolving,
+  .signin-seal-badge, .signin-seal-ring, .signin-seal-badge .seal-check,
+  #app-content.is-entering,
+  #app-content.is-entering .agent-node,
+  #app-content.is-entering .stat-card-mini,
+  #app-content.is-entering .glass-panel { animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+}

@@ -13,17 +13,122 @@ let currentProcessId = null;
 let swarmWatchdogTimer = null;
 let currentLanguage = "python";
 const SAFETY_MAX_LOOPS = 30;
+// Set the moment the user submits the sign-in form. Supabase's onAuthStateChange fires on its
+// own as soon as the session lands and calls onUserAuthenticated() first — without this flag
+// that call would hide the modal instantly and the explicit interactive call arriving a beat
+// later would find nothing left to animate, so the transition silently never played.
+let pendingInteractiveSignIn = false;
+
+// ── Boot loader ────────────────────────────────────────────────────────────
+// Covers the gap between first paint and the app being usable (Google Fonts,
+// highlight.js, the Supabase SDK and the session check all resolve in that window).
+function initAppLoader() {
+  const loader = document.getElementById("app-loader");
+  if (!loader) return;
+
+  const statusEl = document.getElementById("ldr-status");
+  const phases = [
+    "Initializing autonomous security pipeline",
+    "Waking the agent swarm",
+    "Loading static analysis engines",
+    "Securing your workspace"
+  ];
+  let phase = 0;
+  const cycle = setInterval(() => {
+    phase = (phase + 1) % phases.length;
+    if (statusEl) statusEl.textContent = phases[phase];
+  }, 850);
+
+  let dismissed = false;
+  const dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    clearInterval(cycle);
+    loader.classList.add("is-hidden");
+    document.body.classList.remove("is-booting");
+    // Drop it from the DOM after the fade so its fixed overlay can never intercept clicks.
+    setTimeout(() => loader.remove(), 700);
+  };
+
+  // Show for a beat so the animation doesn't flash-and-vanish on a warm cache, but never
+  // hold the UI hostage: whichever of "page loaded" or the hard failsafe lands first wins.
+  const MIN_VISIBLE_MS = 1400;
+  const started = Date.now();
+  const dismissWhenReady = () => setTimeout(dismiss, Math.max(0, MIN_VISIBLE_MS - (Date.now() - started)));
+
+  if (document.readyState === "complete") dismissWhenReady();
+  else window.addEventListener("load", dismissWhenReady, { once: true });
+
+  // Failsafe — a hung CDN asset must never leave the user stuck behind the overlay.
+  setTimeout(dismiss, 6000);
+}
 
 function initSupabase() {
   if (window.supabase) {
     supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    installAuthenticatedFetch();
     checkSession();
   }
 }
 
+/** Current Supabase access token, refreshed by the SDK when it's close to expiry. */
+async function getAccessToken() {
+  if (!supabaseClient) return null;
+  try {
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    return session ? session.access_token : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Attaches the Supabase bearer token to every same-origin /api/ request.
+ *
+ * Done by wrapping fetch once rather than editing ~17 call sites: any future call is covered
+ * automatically, so an endpoint can't silently end up unauthenticated. The backend now derives
+ * the tenant id from this token and ignores whatever user_id the body/URL claims.
+ */
+function installAuthenticatedFetch() {
+  if (window.__authFetchInstalled) return;
+  window.__authFetchInstalled = true;
+
+  const rawFetch = window.fetch.bind(window);
+  window.fetch = async (input, init = {}) => {
+    const url = typeof input === "string" ? input : (input && input.url) || "";
+    const isOwnApi = url.startsWith("/api/") || url.startsWith(`${location.origin}/api/`);
+    if (!isOwnApi) return rawFetch(input, init);
+
+    const token = await getAccessToken();
+    if (token) {
+      const headers = new Headers(init.headers || (typeof input !== "string" && input.headers) || {});
+      headers.set("Authorization", `Bearer ${token}`);
+      init = { ...init, headers };
+    }
+
+    const res = await rawFetch(input, init);
+    // The token expired or was revoked server-side — drop back to the sign-in screen rather
+    // than leaving a workspace on screen that can no longer talk to the backend.
+    if (res.status === 401) {
+      onUserSignedOut();
+      showAuthError("Your session expired. Please sign in again.");
+    } else if (res.status === 403) {
+      showAuthError("You do not have access to that workspace.");
+    }
+    return res;
+  };
+}
+
 async function checkSession() {
+  // Sign-in is required to reach the workspace. Previously every "not signed in" path here
+  // fell through to continueAsGuest(), which dismissed the auth modal and dropped the visitor
+  // straight into the main page under a shared "guest_devsecops_user" account — so the login
+  // screen was effectively decorative and every guest shared one workspace.
   if (!supabaseClient) {
-    continueAsGuest();
+    // Auth SDK unavailable (offline, CDN blocked) — we cannot verify anyone, so deny entry
+    // rather than granting it. Failing open here would defeat the gate entirely.
+    onUserSignedOut();
+    showAuthError("Authentication service unavailable — check your connection and reload.");
     return;
   }
 
@@ -32,35 +137,144 @@ async function checkSession() {
   if (session && session.user) {
     onUserAuthenticated(session.user);
   } else {
-    continueAsGuest();
+    onUserSignedOut();
   }
 
   supabaseClient.auth.onAuthStateChange((event, session) => {
     if (session && session.user) {
       onUserAuthenticated(session.user);
-    } else if (currentUser && currentUser.id !== "guest_devsecops_user") {
+    } else {
       onUserSignedOut();
     }
   });
 }
 
-function continueAsGuest() {
-  currentUser = { id: "guest_devsecops_user", email: "guest@devsecops.io" };
-  const modal = document.getElementById("auth-modal");
-  if (modal) modal.style.display = "none";
-  const badgeContainer = document.getElementById("user-badge-container");
-  if (badgeContainer) badgeContainer.style.display = "flex";
-  loadUserSessions();
+/** True only for a real, signed-in Supabase user. */
+function isAuthenticated() {
+  return !!(currentUser && currentUser.id && currentUser.id !== "guest_devsecops_user");
 }
 
-function onUserAuthenticated(user) {
+/** Blocks an action and re-opens the sign-in screen. Returns true when the caller must stop. */
+function requireAuth() {
+  if (isAuthenticated()) return false;
+  onUserSignedOut();
+  showAuthError("Please sign in to use the workspace.");
+  return true;
+}
+
+function showAuthError(message) {
+  const box = document.getElementById("auth-error");
+  const text = document.getElementById("auth-error-text");
+  if (text) text.innerText = message;
+  if (box) box.style.display = "block";
+}
+
+// continueAsGuest() intentionally removed — the workspace now requires a real signed-in
+// account. It used to log everyone in as a single shared "guest_devsecops_user", which both
+// bypassed the login screen and pooled every unauthenticated visitor's sessions, generated
+// code and security reports into one common workspace on disk.
+
+/**
+ * 3D hand-off from the sign-in card into the workspace.
+ *
+ * Timeline: the auth card flips back in perspective and recedes, a success seal stamps in
+ * with expanding rings, the overlay dissolves, and the workspace rises into place with its
+ * stat cards and agent nodes staggering in. Cleans every class up afterwards so a later
+ * sign-out → sign-in replays it correctly.
+ */
+function playSignInTransition() {
+  const modal = document.getElementById("auth-modal");
+  const card = modal ? modal.querySelector(".auth-card") : null;
+  const app = document.getElementById("app-content");
+  if (!modal) return;
+  // onUserAuthenticated() legitimately runs twice for one sign-in (the SDK's onAuthStateChange
+  // and the form's own call). The modal stays visible for the first ~1.25s of the sequence, so
+  // the second call would otherwise start a whole second overlapping run — two seals, and two
+  // competing cleanup timers that left `is-entering` stuck on the workspace.
+  if (window.__signInTransitionPlaying) return;
+  window.__signInTransitionPlaying = true;
+
+  const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduced) {
+    modal.style.display = "none";
+    window.__signInTransitionPlaying = false;
+    return;
+  }
+
+  if (card) card.classList.add("is-signing-in");
+  modal.classList.add("is-dissolving");
+
+  // Success seal, injected for the duration of the animation only.
+  const seal = document.createElement("div");
+  seal.className = "signin-seal";
+  seal.innerHTML = `
+    <div class="signin-seal-badge">
+      <span class="signin-seal-ring"></span>
+      <span class="signin-seal-ring"></span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        <path class="seal-check" d="M8.5 12.1l2.5 2.5 4.6-4.9"/>
+      </svg>
+    </div>`;
+  document.body.appendChild(seal);
+
+  // Workspace rises in just after the card starts clearing out of the way.
+  if (app) {
+    setTimeout(() => {
+      app.classList.add("is-entering");
+      const clearEntering = () => {
+        app.classList.remove("is-entering");
+        app.removeEventListener("animationend", onEnd);
+      };
+      function onEnd(e) {
+        if (e.target !== app) return;           // ignore the staggered child animations
+        clearEntering();
+      }
+      app.addEventListener("animationend", onEnd);
+      // animationend never fires if the element gets hidden mid-flight (e.g. the session is
+      // rejected and we bounce back to the sign-in screen), which would leave the animation
+      // class stuck on and break the next replay. Always clear it on a timer as well.
+      setTimeout(clearEntering, 1600);
+    }, 380);
+  }
+
+  setTimeout(() => {
+    modal.style.display = "none";
+    modal.classList.remove("is-dissolving");
+    if (card) card.classList.remove("is-signing-in");
+    seal.remove();
+    window.__signInTransitionPlaying = false;
+  }, 1250);
+}
+
+function onUserAuthenticated(user, interactive = false) {
   currentUser = user;
-  document.getElementById("auth-modal").style.display = "none";
+  // The socket usually opens before sign-in completes, so it authenticated as nobody and is
+  // currently receiving no events. Re-send the handshake now that a token exists.
+  authenticateWebSocket();
+
+  const modal = document.getElementById("auth-modal");
+  // Only animate a sign-in the user just performed. Restoring an existing session on page
+  // load must not replay the sequence — the modal was never on screen in that case.
+  const animate = (interactive || pendingInteractiveSignIn) && modal && getComputedStyle(modal).display !== "none";
+  pendingInteractiveSignIn = false;
+
+  // Unlocks #app-content — the only place this class is ever added.
+  document.body.classList.add("is-authenticated");
+  if (animate) {
+    playSignInTransition();
+  } else if (modal) {
+    modal.style.display = "none";
+  }
+  const authError = document.getElementById("auth-error");
+  if (authError) authError.style.display = "none";
   const badgeContainer = document.getElementById("user-badge-container");
   if (badgeContainer) badgeContainer.style.display = "flex";
+  const signinBtn = document.getElementById("signin-btn");
+  if (signinBtn) signinBtn.style.display = "none";
   const signoutBtn = document.getElementById("signout-btn");
   if (signoutBtn) signoutBtn.style.display = "inline-flex";
-  
+
   const emailEl = document.getElementById("user-email-display");
   const avatarEl = document.getElementById("user-avatar-initial");
   if (emailEl) emailEl.innerText = user.email;
@@ -73,9 +287,16 @@ function onUserAuthenticated(user) {
 function onUserSignedOut() {
   currentUser = null;
   currentSessionId = null;
+  // Re-locks the workspace and clears the previous tenant's data out of the DOM so nothing
+  // from their session is left on screen behind the sign-in overlay.
+  document.body.classList.remove("is-authenticated");
+  sessionsList = [];
+  renderSidebarSessions();
   document.getElementById("auth-modal").style.display = "flex";
   const badgeContainer = document.getElementById("user-badge-container");
   if (badgeContainer) badgeContainer.style.display = "none";
+  const signinBtn = document.getElementById("signin-btn");
+  if (signinBtn) signinBtn.style.display = "none";
   const signoutBtn = document.getElementById("signout-btn");
   if (signoutBtn) signoutBtn.style.display = "none";
 }
@@ -125,6 +346,9 @@ async function handleAuthSubmit(event) {
   const errorText = document.getElementById("auth-error-text");
 
   errorBox.style.display = "none";
+  // Claimed by whichever onUserAuthenticated() call lands first (this one or the SDK's
+  // onAuthStateChange), so the transition plays exactly once regardless of ordering.
+  pendingInteractiveSignIn = true;
 
   try {
     if (isSignUpMode) {
@@ -136,7 +360,7 @@ async function handleAuthSubmit(event) {
       if (error) throw error;
 
       if (data.session) {
-        onUserAuthenticated(data.session.user);
+        onUserAuthenticated(data.session.user, true);
       } else {
         alert("Account created successfully! Check your email to confirm registration or sign in.");
       }
@@ -145,10 +369,13 @@ async function handleAuthSubmit(event) {
       if (error) throw error;
 
       if (data.session) {
-        onUserAuthenticated(data.session.user);
+        onUserAuthenticated(data.session.user, true);
       }
     }
   } catch (err) {
+    // Sign-in failed, so nothing will consume the flag — clear it, otherwise a later session
+    // restore (e.g. another tab signing in) would replay the transition out of nowhere.
+    pendingInteractiveSignIn = false;
     errorText.innerText = err.message || 'Authentication failed';
     errorBox.style.display = "block";
   }
@@ -161,14 +388,28 @@ async function handleSignOut() {
   }
 }
 
+/**
+ * Identifies this socket to the server. A browser can't set an Authorization header on a
+ * WebSocket handshake, so the token goes in a first message instead; until the server verifies
+ * it, the socket is sent no tenant-scoped events at all.
+ */
+async function authenticateWebSocket() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const token = await getAccessToken();
+  if (token && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "AUTH", token }));
+  }
+}
+
 function initWebSocket() {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const wsUrl = `${protocol}//${window.location.host}/ws/swarm`;
   
   ws = new WebSocket(wsUrl);
 
-  ws.onopen = () => {
+  ws.onopen = async () => {
     console.log("WebSocket connected to DevSecOps Swarm.");
+    await authenticateWebSocket();
     const st = document.getElementById("status-text");
     if (st) st.innerText = "System Ready";
     if (window.__wasDisconnected) {
@@ -179,6 +420,7 @@ function initWebSocket() {
 
   ws.onmessage = (event) => {
     const data = JSON.parse(event.data);
+    if (data.type === "AUTH_RESULT") return;  // handshake ack, not a pipeline event
     if (!data.user_id || (currentUser && data.user_id === currentUser.id)) {
       if (!data.session_id || data.session_id === currentSessionId) {
         handleSwarmEvent(data);
@@ -219,9 +461,13 @@ function loadUserSessions() {
   if (!currentUser) return;
 
   fetch(`/api/sessions/${currentUser.id}`)
-    .then(res => res.json())
+    .then(res => (res.ok ? res.json() : null))
     .then(sessions => {
-      sessionsList = sessions || [];
+      // A rejected request returns an error object, not a list. Assigning that straight to
+      // sessionsList made every later sessionsList.forEach(...) throw, so one expired token
+      // turned into a broken sidebar and a console full of TypeErrors.
+      if (!Array.isArray(sessions)) return;   // 401/403 already handled by the fetch wrapper
+      sessionsList = sessions;
       renderSidebarSessions();
       if (sessionsList.length > 0 && !currentSessionId) {
         loadSession(sessionsList[0].id);
@@ -317,6 +563,10 @@ function loadSession(sessionId) {
   fetch(`/api/sessions/${currentUser.id}/${sessionId}`)
     .then(res => res.json())
     .then(data => {
+      currentLanguage = data.language || "python";
+      const langSelect = document.getElementById("language-select");
+      if (langSelect) langSelect.value = currentLanguage;
+
       if (data.app_code) {
         updateCodeView(data.app_code);
       } else {
@@ -338,6 +588,28 @@ function loadSession(sessionId) {
         renderAuditReport(data.vulnerability_report);
       } else {
         document.getElementById("audit-display").innerHTML = '<p class="empty-state">No security vulnerability report generated yet for this session.</p>';
+      }
+
+      const beforeEl = document.getElementById("diff-before");
+      const afterEl = document.getElementById("diff-after");
+      if (data.diff_before && data.diff_after) {
+        if (beforeEl) {
+          beforeEl.textContent = data.diff_before;
+          if (window.hljs) { delete beforeEl.dataset.highlighted; hljs.highlightElement(beforeEl); }
+        }
+        if (afterEl) {
+          afterEl.textContent = data.diff_after;
+          if (window.hljs) { delete afterEl.dataset.highlighted; hljs.highlightElement(afterEl); }
+        }
+      } else {
+        if (beforeEl) {
+          beforeEl.textContent = "# Vulnerable code version pre-patch will appear here...";
+          if (window.hljs) { delete beforeEl.dataset.highlighted; hljs.highlightElement(beforeEl); }
+        }
+        if (afterEl) {
+          afterEl.textContent = "# Securitized code version post-patch will appear here...";
+          if (window.hljs) { delete afterEl.dataset.highlighted; hljs.highlightElement(afterEl); }
+        }
       }
 
       const runOut = document.getElementById("run-output");
@@ -423,10 +695,7 @@ function downloadSecurePackage() {
 
 function startSwarm() {
   if (isRunning) return;
-
-  if (!currentUser) {
-    continueAsGuest();
-  }
+  if (requireAuth()) return;
 
   if (!currentSessionId) {
     fetch("/api/sessions/create", {
@@ -447,10 +716,12 @@ function startSwarm() {
 
   const promptInput = document.getElementById("prompt-input");
   const prompt = promptInput ? promptInput.value.trim() : "";
-  // No manual loop picker — the agents keep going until the code is secure and passing,
-  // or the built-in "no progress" safety net gives up. SAFETY_MAX_LOOPS is just a hard
-  // ceiling to prevent a truly runaway loop, not something users tune.
-  const maxLoops = SAFETY_MAX_LOOPS;
+  // User-chosen iteration limit, clamped to SAFETY_MAX_LOOPS as a hard ceiling against a
+  // runaway loop. The backend's own "no progress" and time-budget guards can still stop a
+  // run earlier than this — this is the upper bound, not a target to reach.
+  const loopSelect = document.getElementById("max-loops-select");
+  const chosenLoops = loopSelect ? parseInt(loopSelect.value, 10) : 5;
+  const maxLoops = Math.min(Number.isNaN(chosenLoops) ? 5 : chosenLoops, SAFETY_MAX_LOOPS);
   const selectedModel = document.getElementById("model-select").value;
   const langSelect = document.getElementById("language-select");
   const selectedLanguage = langSelect ? langSelect.value : "python";
@@ -483,6 +754,13 @@ function startSwarm() {
     })
   }).then(res => res.json())
   .then(data => {
+    if (data.status === "already_running") {
+      // The backend already has a run active for this session (e.g. this button's own
+      // watchdog reset it client-side while the server was still genuinely working) —
+      // don't claim we started a new one, and don't leave the button falsely re-enabled.
+      appendTerminal(`\n[System] ${data.message || "A run is already active for this session."}`, "cmd");
+      return;
+    }
     appendTerminal(`[System] Swarm workflow triggered for prompt: "${prompt}" (Session: ${currentSessionId})`, "system");
     setTimeout(loadUserSessions, 1000);
   }).catch(err => {
@@ -497,7 +775,10 @@ function startSwarm() {
   clearTimeout(swarmWatchdogTimer);
   swarmWatchdogTimer = setTimeout(() => {
     if (!isRunning) return;
-    appendTerminal(`\n[Watchdog] No response from server after 260s (connection lost or server error). Resetting — please try again.`, "cmd");
+    // Margin above the backend's own per-call model timeout (240s for local Ollama models)
+    // so a single legitimately-slow generation call doesn't itself trip this watchdog —
+    // it should only fire on a genuine hang (dropped connection, crashed server, etc).
+    appendTerminal(`\n[Watchdog] No response from server after 320s (connection lost or server error). Resetting — please try again.`, "cmd");
     isRunning = false;
     const btn = document.getElementById("run-btn");
     if (btn) {
@@ -505,7 +786,7 @@ function startSwarm() {
       btn.innerText = "Execute Swarm Loop";
     }
     ["coder", "tester", "hacker", "patcher"].forEach(a => setAgentState(a, "", "IDLE"));
-  }, 260000);
+  }, 320000);
 }
 
 function toggleEditMode() {
@@ -641,6 +922,7 @@ function runExploitSimulation() {
 
 
 function resetUI(maxLoops = 10) {
+  syncCodeLangClasses();
   document.querySelectorAll(".agent-node").forEach(node => {
     node.className = "agent-node card-static-pop";
   });
@@ -695,9 +977,10 @@ function resetUI(maxLoops = 10) {
 }
 
 function updateCodeView(codeText) {
+  syncCodeLangClasses();
   const editor = document.getElementById("code-editor");
   const codeDisplay = document.getElementById("code-display");
-  
+
   if (editor) editor.value = codeText;
   if (codeDisplay) {
     codeDisplay.textContent = codeText;
@@ -718,11 +1001,12 @@ function highlightAllCodeBlocks() {
 }
 
 function handleSwarmEvent(data) {
+  syncCodeLangClasses();
   if (isRunning && data.type !== "PIPELINE_COMPLETE") {
     clearTimeout(swarmWatchdogTimer);
     swarmWatchdogTimer = setTimeout(() => {
       if (!isRunning) return;
-      appendTerminal(`\n[Watchdog] No response from server after 260s (connection lost or server error). Resetting — please try again.`, "cmd");
+      appendTerminal(`\n[Watchdog] No response from server after 320s (connection lost or server error). Resetting — please try again.`, "cmd");
       isRunning = false;
       const btn = document.getElementById("run-btn");
       if (btn) {
@@ -730,7 +1014,7 @@ function handleSwarmEvent(data) {
         btn.innerText = "Execute Swarm Loop";
       }
       ["coder", "tester", "hacker", "patcher"].forEach(a => setAgentState(a, "", "IDLE"));
-    }, 260000);
+    }, 320000);
   }
 
   switch (data.type) {
@@ -782,15 +1066,15 @@ function handleSwarmEvent(data) {
       break;
 
     case "FILE_STREAM":
-      if (data.file === "app.py") {
+      if (data.file.startsWith("generated_app.")) {
         updateCodeView(data.content);
       }
       break;
 
     case "FILE_UPDATE":
-      if (data.file === "app.py") {
+      if (data.file.startsWith("generated_app.")) {
         updateCodeView(data.content);
-      } else if (data.file === "test_app.py") {
+      } else if (data.file.startsWith("test_generated_app.")) {
         const testEl = document.getElementById("test-display");
         if (testEl) {
           testEl.textContent = data.content;
@@ -855,7 +1139,19 @@ function handleSwarmEvent(data) {
       document.getElementById("run-btn").disabled = false;
       document.getElementById("run-btn").innerText = "Execute Swarm Loop";
       const statusComp = document.getElementById("status-text");
-      if (statusComp) statusComp.innerText = "Verified Secure";
+      if (statusComp) {
+        const statusLabels = {
+          SUCCESS: "Verified Secure",
+          // Security audit passed but QA only ran a placeholder test — must not read as a
+          // clean bill of health, because the app's behaviour was never actually checked.
+          SUCCESS_UNVERIFIED: "Secure — Tests Not Verified",
+          STUCK: "Stopped — No Fix Found",
+          MAX_LOOPS_REACHED: "Stopped — Loop Limit Reached",
+          TIME_LIMIT: "Stopped — Time Limit Reached",
+          ERROR: "Error",
+        };
+        statusComp.innerText = statusLabels[data.status] || "Stopped";
+      }
       appendTerminal(`\n[Pipeline Complete] ${cleanText(data.message)}`, "cmd");
       loadUserSessions();
       loadWorkspaceFiles();
@@ -931,8 +1227,19 @@ function getActiveLanguage() {
   return (typeof currentLanguage !== 'undefined' && currentLanguage) ? currentLanguage : "python";
 }
 
+// The code/test/diff panels' <code> elements were hardcoded with class="language-python" in
+// the HTML, so hljs kept applying Python syntax rules to C++/Java sessions. Re-tag them with
+// the actual active language before every highlight pass.
+function syncCodeLangClasses() {
+  const lang = getActiveLanguage();
+  ["code-display", "test-display", "diff-before", "diff-after"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.className = `language-${lang}`;
+  });
+}
+
 function runInteractive() {
-  if (!currentUser) continueAsGuest();
+  if (requireAuth()) return;
   const code = getActiveCode();
   if (!code.trim()) { alert("No code to run. Generate code first or paste it in the editor."); return; }
 
@@ -1022,7 +1329,7 @@ function getActiveCode() {
 }
 
 function runActiveCode() {
-  if (!currentUser) continueAsGuest();
+  if (requireAuth()) return;
 
   const code = getActiveCode();
   if (!code.trim()) return;
@@ -1122,6 +1429,7 @@ function escapeHtml(text) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  initAppLoader();
   initSupabase();
   initWebSocket();
   loadAvailableModels();

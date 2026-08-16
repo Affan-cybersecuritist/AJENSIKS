@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '../../lib/supabaseClient';
+import BootLoader from '../../components/BootLoader';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -13,13 +14,22 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  // Kept false until the session lookup settles, so the loader stays up through it. An
+  // already-signed-in visitor gets redirected to /dashboard from under the loader and never
+  // sees the login form flash on screen.
+  const [sessionChecked, setSessionChecked] = useState(false);
 
   useEffect(() => {
     // Check if user is already logged in -> Auto redirect to /dashboard
     const checkSession = async () => {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session) {
-        router.push('/dashboard');
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session) {
+          router.push('/dashboard');
+          return; // keep the loader up across the redirect instead of flashing the form
+        }
+      } finally {
+        setSessionChecked(true);
       }
     };
     checkSession();
@@ -75,15 +85,18 @@ export default function LoginPage() {
           router.push('/dashboard');
         }
       }
-    } catch (err: any) {
-      setErrorMsg(err.message || 'An authentication error occurred');
+    } catch (err) {
+      const error = err as Error;
+      setErrorMsg(error.message || 'An authentication error occurred');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="auth-page-container">
+    <>
+      <BootLoader ready={sessionChecked} />
+      <div className="auth-page-container">
       <div className="auth-card">
         <div className="auth-header">
           <div className="auth-logo">🔒 Multi-Tenant Auth</div>
@@ -167,6 +180,7 @@ export default function LoginPage() {
           </button>
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

@@ -523,3 +523,137 @@ body {
     grid-template-columns: 1fr;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Boot Loader (components/BootLoader.tsx)
+   Covers the first-paint gap while the Supabase SDK loads and the session check
+   runs — on /login that check can end in a redirect to /dashboard, so without
+   this the login form visibly flashes before the user is navigated away.
+   Palette follows this app's dark cyan/purple theme (NOT the cherry/cream theme
+   used by the static swarm UI on :8000 — different frontend, different skin).
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.nx-loader {
+  position: fixed;
+  inset: 0;
+  /* Sized with viewport units rather than relying on inset:0 alone: when the page
+     behind is wider than the viewport, the containing block a fixed element resolves
+     against can match that wider content and stretch the overlay off-screen. */
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  max-width: 100vw;
+  overflow: hidden;
+  z-index: 99999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #0b0f19;
+  background-image:
+    radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.13) 0px, transparent 55%),
+    radial-gradient(at 100% 100%, rgba(168, 85, 247, 0.13) 0px, transparent 55%);
+  font-family: var(--font-main);
+  opacity: 1;
+  transition: opacity .55s ease, visibility .55s ease;
+}
+.nx-loader.is-hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+body.nx-booting { overflow: hidden; }
+
+.nx-grid {
+  position: absolute; inset: -50%;
+  background-image:
+    linear-gradient(rgba(56,189,248,.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56,189,248,.05) 1px, transparent 1px);
+  background-size: 46px 46px;
+  animation: nxDrift 22s linear infinite;
+}
+@keyframes nxDrift { to { transform: translate3d(46px, 46px, 0); } }
+
+.nx-glow { position: absolute; width: 520px; height: 520px; border-radius: 50%; filter: blur(150px); pointer-events: none; }
+.nx-glow-a { top: -170px; left: -140px; background: rgba(56,189,248,.28); animation: nxFloat 9s ease-in-out infinite; }
+.nx-glow-b { bottom: -180px; right: -140px; background: rgba(168,85,247,.26); animation: nxFloat 11s ease-in-out infinite reverse; }
+@keyframes nxFloat { 0%,100% { transform: translate(0,0); } 50% { transform: translate(34px,-26px); } }
+
+.nx-core { position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; padding: 0 24px; }
+
+.nx-shield-wrap { position: relative; width: 132px; height: 132px; display: grid; place-items: center; margin-bottom: 30px; }
+.nx-ring {
+  position: absolute; inset: 0; border-radius: 50%; padding: 2px;
+  background: conic-gradient(from 0deg, transparent 0deg, rgba(56,189,248,.12) 90deg, #38bdf8 190deg, #a855f7 250deg, transparent 330deg);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+          mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+  animation: nxSpin 2.6s linear infinite;
+}
+.nx-ring-2 { inset: 13px; animation: nxSpin 3.8s linear infinite reverse; opacity: .55; }
+@keyframes nxSpin { to { transform: rotate(360deg); } }
+
+.nx-shield {
+  position: relative; width: 82px; height: 82px; display: grid; place-items: center;
+  border-radius: 24px; overflow: hidden;
+  background: linear-gradient(150deg, rgba(30,41,59,.95) 0%, rgba(17,24,39,.95) 100%);
+  border: 1px solid rgba(56,189,248,.22);
+  box-shadow: 0 14px 40px -10px rgba(56,189,248,.4), inset 0 1px 0 rgba(255,255,255,.07);
+  animation: nxBreathe 2.8s ease-in-out infinite;
+}
+@keyframes nxBreathe {
+  0%,100% { transform: translateY(0) scale(1);      box-shadow: 0 14px 40px -10px rgba(56,189,248,.4),  inset 0 1px 0 rgba(255,255,255,.07); }
+  50%     { transform: translateY(-5px) scale(1.035); box-shadow: 0 24px 52px -10px rgba(168,85,247,.5), inset 0 1px 0 rgba(255,255,255,.07); }
+}
+.nx-shield svg { width: 42px; height: 42px; color: #38bdf8; overflow: visible; }
+.nx-shield .nx-check { stroke: #a855f7; stroke-dasharray: 22; stroke-dashoffset: 22; animation: nxDraw 2.8s ease-in-out infinite; }
+@keyframes nxDraw { 0%,18% { stroke-dashoffset: 22; } 46%,74% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: 22; } }
+
+.nx-scan {
+  position: absolute; left: -60%; top: 0; width: 60%; height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(56,189,248,.3), transparent);
+  animation: nxSweep 2.2s ease-in-out infinite;
+}
+@keyframes nxSweep { 0% { left: -60%; } 60%,100% { left: 110%; } }
+
+.nx-title { font-size: 30px; font-weight: 800; letter-spacing: -.6px; color: #f3f4f6; margin-bottom: 8px; }
+.nx-title span {
+  background: linear-gradient(100deg, #38bdf8, #a855f7);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+}
+.nx-sub { font-size: 13.5px; font-weight: 400; color: #9ca3af; letter-spacing: .2px; margin-bottom: 26px; }
+
+.nx-steps { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 26px; }
+.nx-step {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 11.5px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase;
+  color: #9ca3af; background: rgba(17,24,39,.75); border: 1px solid rgba(255,255,255,.08);
+  padding: 7px 13px; border-radius: 999px; backdrop-filter: blur(8px);
+  opacity: .45; transform: translateY(4px);
+  animation: nxStepIn .5s ease forwards, nxStepPulse 3.2s ease-in-out infinite;
+  animation-delay: calc(var(--i) * .16s), calc(var(--i) * .16s + .5s);
+}
+.nx-step i {
+  width: 6px; height: 6px; border-radius: 50%; background: #38bdf8;
+  box-shadow: 0 0 0 0 rgba(56,189,248,.5);
+  animation: nxDot 3.2s ease-in-out infinite; animation-delay: calc(var(--i) * .16s + .5s);
+}
+@keyframes nxStepIn { to { opacity: 1; transform: translateY(0); } }
+@keyframes nxStepPulse {
+  0%,100% { border-color: rgba(255,255,255,.08); color: #9ca3af; background: rgba(17,24,39,.75); }
+  12%,26% { border-color: rgba(56,189,248,.5);   color: #e0f2fe; background: rgba(56,189,248,.12); }
+}
+@keyframes nxDot { 0%,100% { box-shadow: 0 0 0 0 rgba(56,189,248,.5); } 12%,26% { box-shadow: 0 0 0 5px rgba(56,189,248,0); } }
+
+.nx-bar { position: relative; width: 230px; height: 4px; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; }
+.nx-bar span {
+  position: absolute; inset: 0; width: 40%; border-radius: 999px;
+  background: linear-gradient(90deg, #38bdf8, #2563eb, #a855f7);
+  animation: nxTrack 1.55s cubic-bezier(.55,.1,.35,.95) infinite;
+}
+@keyframes nxTrack { 0% { transform: translateX(-105%); } 100% { transform: translateX(255%); } }
+
+@media (max-width: 480px) {
+  .nx-title { font-size: 23px; }
+  .nx-step { font-size: 10px; padding: 6px 10px; }
+  .nx-shield-wrap { width: 112px; height: 112px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nx-grid, .nx-glow, .nx-ring, .nx-shield, .nx-scan, .nx-check, .nx-step, .nx-step i { animation: none !important; }
+  .nx-step { opacity: 1; transform: none; }
+  .nx-bar span { animation: nxTrack 1.6s linear infinite; }
+}

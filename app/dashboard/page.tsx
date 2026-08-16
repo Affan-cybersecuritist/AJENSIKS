@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { supabase, WorkspaceItem } from '../../lib/supabaseClient';
 import Navbar from '../../components/Navbar';
+import BootLoader from '../../components/BootLoader';
 import { User } from '@supabase/supabase-js';
 
 export default function DashboardPage() {
@@ -59,9 +60,10 @@ export default function DashboardPage() {
 
       if (error) throw error;
       setWorkspaces(data || []);
-    } catch (err: any) {
-      console.error('Error fetching workspaces:', err);
-      setErrorMsg(err.message || 'Failed to load workspace items');
+    } catch (err) {
+      const error = err as Error;
+      console.error('Error fetching workspaces:', error);
+      setErrorMsg(error.message || 'Failed to load workspace items');
     }
   };
 
@@ -93,8 +95,9 @@ export default function DashboardPage() {
 
       setNewItemName('');
       setNewItemContent('');
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to create workspace item');
+    } catch (err) {
+      const error = err as Error;
+      setErrorMsg(error.message || 'Failed to create workspace item');
     } finally {
       setIsCreating(false);
     }
@@ -114,18 +117,17 @@ export default function DashboardPage() {
       if (error) throw error;
 
       setWorkspaces(workspaces.filter((item) => item.id !== itemId));
-    } catch (err: any) {
-      setErrorMsg(err.message || 'Failed to delete workspace item');
+    } catch (err) {
+      const error = err as Error;
+      setErrorMsg(error.message || 'Failed to delete workspace item');
     }
   };
 
   if (loading) {
-    return (
-      <div className="dashboard-loading">
-        <div className="spinner"></div>
-        <p>Verifying Auth Session & RLS Isolation...</p>
-      </div>
-    );
+    // `ready={false}` holds the loader up for as long as the auth/RLS check actually takes
+    // (its own failsafe still dismisses it if that never resolves), replacing the bare spinner
+    // that used to sit here so both entry points into this app share one polished boot screen.
+    return <BootLoader ready={false} />;
   }
 
   return (

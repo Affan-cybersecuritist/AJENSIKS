@@ -5,3 +5,5 @@ bandit
 pytest
 requests
 python-dotenv
+PyJWT
+cryptography

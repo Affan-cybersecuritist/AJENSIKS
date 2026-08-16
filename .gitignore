@@ -40,3 +40,11 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
+
+# Build artifacts from the C++/Java pipeline (regenerated on every run)
+*.class
+*.o
+*.exe
+generated_app.*
+test_generated_app.*
+tsconfig.tsbuildinfo

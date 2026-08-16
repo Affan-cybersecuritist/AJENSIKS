@@ -9,14 +9,175 @@
   <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <!-- VS Code Dark Theme Highlight.js -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/vs2015.min.css">
-  <link rel="stylesheet" href="/static/styles.css?v=2">
+  <link rel="stylesheet" href="/static/styles.css?v=5">
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+
+  <!-- Boot loader styles are inlined so the loader paints on the very first frame. If they
+       lived in styles.css the user would see a flash of unstyled page while that stylesheet
+       (and the Google Fonts / CDN scripts above) were still downloading — which is exactly
+       the gap this loader exists to cover. -->
+  <style>
+    #app-loader {
+      position: fixed;
+      inset: 0;
+      /* Size explicitly rather than relying on inset:0 alone. The page behind is a wide
+         desktop layout, and on a narrow viewport the initial containing block a fixed element
+         resolves against can end up matching that wide content instead of the visible
+         viewport — which stretched this overlay to ~1500px on a 375px screen and pushed the
+         centred content off-screen. Viewport units resolve against the real viewport, so they
+         stay correct. dvh (where supported) also tracks mobile browser toolbars collapsing. */
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      max-width: 100vw;
+      overflow: hidden;
+      z-index: 99999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background-color: #faf8f5;
+      background-image:
+        radial-gradient(at 0% 0%, rgba(217, 4, 41, 0.07) 0px, transparent 55%),
+        radial-gradient(at 100% 100%, rgba(128, 15, 47, 0.08) 0px, transparent 55%);
+      font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      overflow: hidden;
+      opacity: 1;
+      transition: opacity .55s ease, visibility .55s ease;
+    }
+    #app-loader.is-hidden { opacity: 0; visibility: hidden; pointer-events: none; }
+    body.is-booting { overflow: hidden; }
+
+    /* faint blueprint grid drifting behind everything */
+    .ldr-grid {
+      position: absolute; inset: -50%;
+      background-image:
+        linear-gradient(rgba(128,15,47,.055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(128,15,47,.055) 1px, transparent 1px);
+      background-size: 46px 46px;
+      animation: ldrDrift 22s linear infinite;
+    }
+    @keyframes ldrDrift { to { transform: translate3d(46px, 46px, 0); } }
+
+    .ldr-glow { position: absolute; width: 520px; height: 520px; border-radius: 50%; filter: blur(140px); pointer-events: none; }
+    .ldr-glow-a { top: -160px; left: -140px; background: rgba(217,4,41,.16); animation: ldrFloat 9s ease-in-out infinite; }
+    .ldr-glow-b { bottom: -170px; right: -140px; background: rgba(128,15,47,.15); animation: ldrFloat 11s ease-in-out infinite reverse; }
+    @keyframes ldrFloat { 0%,100% { transform: translate(0,0); } 50% { transform: translate(34px,-26px); } }
+
+    .ldr-core { position: relative; display: flex; flex-direction: column; align-items: center; text-align: center; padding: 0 24px; }
+
+    /* ── shield + orbiting rings ── */
+    .ldr-shield-wrap { position: relative; width: 132px; height: 132px; display: grid; place-items: center; margin-bottom: 30px; }
+    .ldr-ring { position: absolute; inset: 0; border-radius: 50%; padding: 2px;
+      background: conic-gradient(from 0deg, transparent 0deg, rgba(217,4,41,.10) 90deg, #d90429 190deg, #ef233c 250deg, transparent 330deg);
+      -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+              mask: radial-gradient(farthest-side, transparent calc(100% - 2px), #000 calc(100% - 2px));
+      animation: ldrSpin 2.6s linear infinite;
+    }
+    .ldr-ring-2 { inset: 13px; animation: ldrSpin 3.8s linear infinite reverse; opacity: .5; }
+    @keyframes ldrSpin { to { transform: rotate(360deg); } }
+
+    .ldr-shield {
+      position: relative; width: 82px; height: 82px; display: grid; place-items: center;
+      border-radius: 24px; overflow: hidden;
+      background: linear-gradient(150deg, #ffffff 0%, #fff0f3 100%);
+      border: 1px solid rgba(128,15,47,.14);
+      box-shadow: 0 14px 34px -10px rgba(128,15,47,.42), inset 0 1px 0 rgba(255,255,255,.9);
+      animation: ldrBreathe 2.8s ease-in-out infinite;
+    }
+    @keyframes ldrBreathe {
+      0%,100% { transform: translateY(0) scale(1); box-shadow: 0 14px 34px -10px rgba(128,15,47,.42), inset 0 1px 0 rgba(255,255,255,.9); }
+      50%     { transform: translateY(-5px) scale(1.035); box-shadow: 0 22px 44px -10px rgba(217,4,41,.5), inset 0 1px 0 rgba(255,255,255,.9); }
+    }
+    .ldr-shield svg { width: 42px; height: 42px; color: #d90429; overflow: visible; }
+    .ldr-shield .ldr-check { stroke: #800f2f; stroke-dasharray: 22; stroke-dashoffset: 22; animation: ldrDraw 2.8s ease-in-out infinite; }
+    @keyframes ldrDraw { 0%,18% { stroke-dashoffset: 22; } 46%,74% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: 22; } }
+
+    /* sweeping scan line across the shield tile */
+    .ldr-scan { position: absolute; left: -60%; top: 0; width: 60%; height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(217,4,41,.22), transparent);
+      animation: ldrSweep 2.2s ease-in-out infinite; }
+    @keyframes ldrSweep { 0% { left: -60%; } 60%,100% { left: 110%; } }
+
+    .ldr-title { font-size: 30px; font-weight: 800; letter-spacing: -.6px; color: #2b1b22; margin-bottom: 8px; }
+    .ldr-title span { background: linear-gradient(100deg, #d90429, #800f2f); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+    .ldr-sub { font-size: 13.5px; font-weight: 400; color: #6b5b63; letter-spacing: .2px; margin-bottom: 26px; }
+
+    /* ── the four agents lighting up in pipeline order ── */
+    .ldr-agents { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 26px; }
+    .ldr-agent {
+      display: inline-flex; align-items: center; gap: 7px;
+      font-size: 11.5px; font-weight: 600; letter-spacing: .5px; text-transform: uppercase;
+      color: #6b5b63; background: rgba(255,255,255,.8); border: 1px solid rgba(128,15,47,.12);
+      padding: 7px 13px; border-radius: 999px; backdrop-filter: blur(8px);
+      opacity: .45; transform: translateY(4px);
+      animation: ldrAgentIn .5s ease forwards, ldrAgentPulse 3.2s ease-in-out infinite;
+      animation-delay: calc(var(--i) * .16s), calc(var(--i) * .16s + .5s);
+    }
+    .ldr-agent i { width: 6px; height: 6px; border-radius: 50%; background: #d90429; box-shadow: 0 0 0 0 rgba(217,4,41,.5); animation: ldrDot 3.2s ease-in-out infinite; animation-delay: calc(var(--i) * .16s + .5s); }
+    @keyframes ldrAgentIn { to { opacity: 1; transform: translateY(0); } }
+    @keyframes ldrAgentPulse {
+      0%,100% { border-color: rgba(128,15,47,.12); color: #6b5b63; background: rgba(255,255,255,.8); }
+      12%,26% { border-color: rgba(217,4,41,.45); color: #800f2f; background: #fff0f3; }
+    }
+    @keyframes ldrDot { 0%,100% { box-shadow: 0 0 0 0 rgba(217,4,41,.45); } 12%,26% { box-shadow: 0 0 0 5px rgba(217,4,41,0); } }
+
+    /* ── progress bar ── */
+    .ldr-bar { position: relative; width: 230px; height: 4px; border-radius: 999px; background: rgba(128,15,47,.1); overflow: hidden; }
+    .ldr-bar span { position: absolute; inset: 0; width: 40%; border-radius: 999px;
+      background: linear-gradient(90deg, #ef233c, #d90429, #800f2f);
+      animation: ldrTrack 1.55s cubic-bezier(.55,.1,.35,.95) infinite; }
+    @keyframes ldrTrack { 0% { transform: translateX(-105%); } 100% { transform: translateX(255%); } }
+
+    @media (max-width: 480px) {
+      .ldr-title { font-size: 23px; }
+      .ldr-agent { font-size: 10px; padding: 6px 10px; }
+      .ldr-shield-wrap { width: 112px; height: 112px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .ldr-grid, .ldr-glow, .ldr-ring, .ldr-shield, .ldr-scan, .ldr-check, .ldr-agent, .ldr-agent i { animation: none !important; }
+      .ldr-agent { opacity: 1; transform: none; }
+      .ldr-bar span { animation: ldrTrack 1.6s linear infinite; }
+    }
+  </style>
 </head>
-<body>
+<body class="is-booting">
+  <!-- ══ Boot Loader (removed by initAppLoader() in app.js once the page is ready) ══ -->
+  <div id="app-loader" role="status" aria-live="polite" aria-label="Loading DevSecOps AI Swarm Platform">
+    <div class="ldr-grid" aria-hidden="true"></div>
+    <div class="ldr-glow ldr-glow-a" aria-hidden="true"></div>
+    <div class="ldr-glow ldr-glow-b" aria-hidden="true"></div>
+
+    <div class="ldr-core">
+      <div class="ldr-shield-wrap">
+        <div class="ldr-ring" aria-hidden="true"></div>
+        <div class="ldr-ring ldr-ring-2" aria-hidden="true"></div>
+        <div class="ldr-shield">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path class="ldr-check" d="M8.6 12.1l2.4 2.4 4.5-4.7"/>
+          </svg>
+          <span class="ldr-scan" aria-hidden="true"></span>
+        </div>
+      </div>
+
+      <h1 class="ldr-title">DevSecOps <span>AI Swarm</span></h1>
+      <p class="ldr-sub" id="ldr-status">Initializing autonomous security pipeline</p>
+
+      <div class="ldr-agents" aria-hidden="true">
+        <span class="ldr-agent" style="--i:0"><i></i>Coder</span>
+        <span class="ldr-agent" style="--i:1"><i></i>Tester</span>
+        <span class="ldr-agent" style="--i:2"><i></i>Hacker</span>
+        <span class="ldr-agent" style="--i:3"><i></i>Patcher</span>
+      </div>
+
+      <div class="ldr-bar" aria-hidden="true"><span></span></div>
+    </div>
+  </div>
+
   <!-- Ambient Light Background Glows -->
   <div class="ambient-glow glow-1"></div>
   <div class="ambient-glow glow-2"></div>
@@ -63,9 +224,8 @@
         <button type="button" class="btn-toggle" onclick="toggleAuthMode()">Sign Up</button>
       </div>
 
-      <div style="margin-top: 12px; text-align: center;">
-        <button type="button" onclick="continueAsGuest()" style="background: transparent; border: 1px solid rgba(255,255,255,0.2); color: rgba(255,255,255,0.5); padding: 8px 20px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: var(--font-main);">Continue as Guest (No Login)</button>
-      </div>
+      <!-- The "Continue as Guest (No Login)" button was removed: it bypassed the sign-in gate
+           and put every unauthenticated visitor into one shared workspace account. -->
     </div>
   </div>
 
@@ -139,6 +299,7 @@
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             <span>Export Package</span>
           </button>
+          <button class="logout-btn btn-3d" id="signin-btn" onclick="openAuthModal()" style="display: none;">Sign In</button>
           <button class="logout-btn btn-3d" id="signout-btn" onclick="signOutUser()" style="display: none;">Sign Out</button>
         </div>
       </header>
@@ -176,6 +337,17 @@
                   <option value="python" selected>Python</option>
                   <option value="cpp">C++</option>
                   <option value="java">Java</option>
+                </select>
+              </div>
+
+              <div class="control-field">
+                <label for="max-loops-select">Iteration Limit</label>
+                <select id="max-loops-select">
+                  <option value="3">3 Loops</option>
+                  <option value="5" selected>5 Loops</option>
+                  <option value="10">10 Loops</option>
+                  <option value="20">20 Loops</option>
+                  <option value="30">30 Loops</option>
                 </select>
               </div>
 
@@ -447,6 +619,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=14"></script>
 </body>
 </html>
